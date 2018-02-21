@@ -69,9 +69,8 @@ void SharedArrayBufferBuiltinsAssembler::ValidateSharedTypedArray(
 
   BIND(&invalid);
   {
-    CallRuntime(Runtime::kThrowNotIntegerSharedTypedArrayError, context,
-                tagged);
-    Unreachable();
+    ThrowTypeError(context, MessageTemplate::kNotIntegerSharedTypedArray,
+                   tagged);
   }
 
   BIND(&not_float_or_clamped);
@@ -101,10 +100,7 @@ Node* SharedArrayBufferBuiltinsAssembler::ConvertTaggedAtomicIndexToWord32(
   Goto(&done);
 
   BIND(&range_error);
-  {
-    CallRuntime(Runtime::kThrowInvalidAtomicAccessIndexError, context);
-    Unreachable();
-  }
+  { ThrowRangeError(context, MessageTemplate::kInvalidAtomicAccessIndex); }
 
   BIND(&done);
   return var_result.value();
@@ -119,8 +115,7 @@ void SharedArrayBufferBuiltinsAssembler::ValidateAtomicIndex(Node* array,
       context, LoadObjectField(array, JSTypedArray::kLengthOffset));
   GotoIf(Uint32LessThan(index_word, array_length_word32), &check_passed);
 
-  CallRuntime(Runtime::kThrowInvalidAtomicAccessIndexError, context);
-  Unreachable();
+  ThrowRangeError(context, MessageTemplate::kInvalidAtomicAccessIndex);
 
   BIND(&check_passed);
 }
@@ -213,7 +208,7 @@ TF_BUILTIN(AtomicsStore, SharedArrayBufferBuiltinsAssembler) {
   ValidateAtomicIndex(array, index_word32, context);
   Node* index_word = ChangeUint32ToWord(index_word32);
 
-  Node* value_integer = ToInteger(context, value);
+  Node* value_integer = ToInteger_Inline(CAST(context), CAST(value));
   Node* value_word32 = TruncateTaggedToWord32(context, value_integer);
 
 #if DEBUG
@@ -266,7 +261,7 @@ TF_BUILTIN(AtomicsExchange, SharedArrayBufferBuiltinsAssembler) {
       ConvertTaggedAtomicIndexToWord32(index, context, &index_integer);
   ValidateAtomicIndex(array, index_word32, context);
 
-  Node* value_integer = ToInteger(context, value);
+  Node* value_integer = ToInteger_Inline(CAST(context), CAST(value));
 
 #if DEBUG
   DebugSanityCheckAtomicIndex(array, index_word32, context);
@@ -340,8 +335,8 @@ TF_BUILTIN(AtomicsCompareExchange, SharedArrayBufferBuiltinsAssembler) {
       ConvertTaggedAtomicIndexToWord32(index, context, &index_integer);
   ValidateAtomicIndex(array, index_word32, context);
 
-  Node* old_value_integer = ToInteger(context, old_value);
-  Node* new_value_integer = ToInteger(context, new_value);
+  Node* old_value_integer = ToInteger_Inline(CAST(context), CAST(old_value));
+  Node* new_value_integer = ToInteger_Inline(CAST(context), CAST(new_value));
 
 #if DEBUG
   DebugSanityCheckAtomicIndex(array, index_word32, context);
@@ -436,7 +431,7 @@ void SharedArrayBufferBuiltinsAssembler::AtomicBinopBuiltinCommon(
       ConvertTaggedAtomicIndexToWord32(index, context, &index_integer);
   ValidateAtomicIndex(array, index_word32, context);
 
-  Node* value_integer = ToInteger(context, value);
+  Node* value_integer = ToInteger_Inline(CAST(context), CAST(value));
 
 #if DEBUG
   // In Debug mode, we re-validate the index as a sanity check because

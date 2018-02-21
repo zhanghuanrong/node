@@ -60,8 +60,9 @@ Deserializer<AllocatorT>::~Deserializer() {
 // This is called on the roots.  It is the driver of the deserialization
 // process.  It is also called on the body of each function.
 template <class AllocatorT>
-void Deserializer<AllocatorT>::VisitRootPointers(Root root, Object** start,
-                                                 Object** end) {
+void Deserializer<AllocatorT>::VisitRootPointers(Root root,
+                                                 const char* description,
+                                                 Object** start, Object** end) {
   // Builtins and bytecode handlers are deserialized in a separate pass by the
   // BuiltinDeserializer.
   if (root == Root::kBuiltins || root == Root::kDispatchTable) return;
@@ -192,14 +193,21 @@ HeapObject* Deserializer<AllocatorT>::PostProcessNewObject(HeapObject* obj,
     if (isolate_->external_reference_redirector()) {
       call_handler_infos_.push_back(CallHandlerInfo::cast(obj));
     }
-  } else if (obj->IsExternalOneByteString()) {
-    DCHECK(obj->map() == isolate_->heap()->native_source_string_map());
-    ExternalOneByteString* string = ExternalOneByteString::cast(obj);
-    DCHECK(string->is_short());
-    string->set_resource(
-        NativesExternalStringResource::DecodeForDeserialization(
-            string->resource()));
-    isolate_->heap()->RegisterExternalString(string);
+  } else if (obj->IsExternalString()) {
+    if (obj->map() == isolate_->heap()->native_source_string_map()) {
+      ExternalOneByteString* string = ExternalOneByteString::cast(obj);
+      DCHECK(string->is_short());
+      string->set_resource(
+          NativesExternalStringResource::DecodeForDeserialization(
+              string->resource()));
+    } else {
+      ExternalString* string = ExternalString::cast(obj);
+      uint32_t index = string->resource_as_uint32();
+      Address address =
+          reinterpret_cast<Address>(isolate_->api_external_references()[index]);
+      string->set_address_as_resource(address);
+    }
+    isolate_->heap()->RegisterExternalString(String::cast(obj));
   } else if (obj->IsJSTypedArray()) {
     JSTypedArray* typed_array = JSTypedArray::cast(obj);
     CHECK(typed_array->byte_offset()->IsSmi());
@@ -234,6 +242,13 @@ HeapObject* Deserializer<AllocatorT>::PostProcessNewObject(HeapObject* obj,
       void* backing_store = off_heap_backing_stores_[store_index->value()];
       fta->set_external_pointer(backing_store);
     }
+  } else if (obj->IsBytecodeArray()) {
+    // TODO(mythria): Remove these once we store the default values for these
+    // fields in the serializer.
+    BytecodeArray* bytecode_array = BytecodeArray::cast(obj);
+    bytecode_array->set_interrupt_budget(
+        interpreter::Interpreter::InterruptBudget());
+    bytecode_array->set_osr_loop_nesting_level(0);
   }
   // Check alignment.
   DCHECK_EQ(0, Heap::GetFillToAlign(obj->address(), obj->RequiredAlignment()));
@@ -364,8 +379,11 @@ bool Deserializer<AllocatorT>::ReadData(Object** current, Object** limit,
   CASE_STATEMENT(where, how, within, NEW_SPACE)  \
   CASE_BODY(where, how, within, NEW_SPACE)       \
   CASE_STATEMENT(where, how, within, OLD_SPACE)  \
+  V8_FALLTHROUGH;                                \
   CASE_STATEMENT(where, how, within, CODE_SPACE) \
+  V8_FALLTHROUGH;                                \
   CASE_STATEMENT(where, how, within, MAP_SPACE)  \
+  V8_FALLTHROUGH;                                \
   CASE_STATEMENT(where, how, within, LO_SPACE)   \
   CASE_BODY(where, how, within, kAnyOldSpace)
 
@@ -466,9 +484,9 @@ bool Deserializer<AllocatorT>::ReadData(Object** current, Object** limit,
         Address pc = code->entry() + pc_offset;
         Address target = code->entry() + target_offset;
         Assembler::deserialization_set_target_internal_reference_at(
-            isolate, pc, target, data == kInternalReference
-                                     ? RelocInfo::INTERNAL_REFERENCE
-                                     : RelocInfo::INTERNAL_REFERENCE_ENCODED);
+            pc, target,
+            data == kInternalReference ? RelocInfo::INTERNAL_REFERENCE
+                                       : RelocInfo::INTERNAL_REFERENCE_ENCODED);
         break;
       }
 
@@ -496,8 +514,7 @@ bool Deserializer<AllocatorT>::ReadData(Object** current, Object** limit,
       case kSynchronize:
         // If we get here then that indicates that you have a mismatch between
         // the number of GC roots when serializing and deserializing.
-        CHECK(false);
-        break;
+        UNREACHABLE();
 
       // Deserialize raw data of variable length.
       case kVariableRawData: {
@@ -572,7 +589,7 @@ bool Deserializer<AllocatorT>::ReadData(Object** current, Object** limit,
         int skip = source_.GetInt();
         current = reinterpret_cast<Object**>(
             reinterpret_cast<intptr_t>(current) + skip);
-        // Fall through.
+        V8_FALLTHROUGH;
       }
 
       SIXTEEN_CASES(kRootArrayConstants)
@@ -591,7 +608,7 @@ bool Deserializer<AllocatorT>::ReadData(Object** current, Object** limit,
         int skip = source_.GetInt();
         current = reinterpret_cast<Object**>(
             reinterpret_cast<Address>(current) + skip);
-        // Fall through.
+        V8_FALLTHROUGH;
       }
 
       FOUR_CASES(kHotObject)
@@ -635,12 +652,30 @@ bool Deserializer<AllocatorT>::ReadData(Object** current, Object** limit,
 #undef SINGLE_CASE
 
       default:
-        CHECK(false);
+        UNREACHABLE();
     }
   }
   CHECK_EQ(limit, current);
   return true;
 }
+
+namespace {
+
+int FixupJSConstructStub(Isolate* isolate, int builtin_id) {
+  if (isolate->serializer_enabled()) return builtin_id;
+
+  if (FLAG_harmony_restrict_constructor_return &&
+      builtin_id == Builtins::kJSConstructStubGenericUnrestrictedReturn) {
+    return Builtins::kJSConstructStubGenericRestrictedReturn;
+  } else if (!FLAG_harmony_restrict_constructor_return &&
+             builtin_id == Builtins::kJSConstructStubGenericRestrictedReturn) {
+    return Builtins::kJSConstructStubGenericUnrestrictedReturn;
+  } else {
+    return builtin_id;
+  }
+}
+
+}  // namespace
 
 template <class AllocatorT>
 template <int where, int how, int within, int space_number_if_any>
@@ -692,7 +727,8 @@ Object** Deserializer<AllocatorT>::ReadDataCase(Isolate* isolate,
       emit_write_barrier = isolate->heap()->InNewSpace(new_object);
     } else {
       DCHECK_EQ(where, kBuiltin);
-      int builtin_id = MaybeReplaceWithDeserializeLazy(source_.GetInt());
+      int raw_id = MaybeReplaceWithDeserializeLazy(source_.GetInt());
+      int builtin_id = FixupJSConstructStub(isolate, raw_id);
       new_object = isolate->builtins()->builtin(builtin_id);
       emit_write_barrier = false;
     }
@@ -714,7 +750,7 @@ Object** Deserializer<AllocatorT>::ReadDataCase(Isolate* isolate,
     if (how == kFromCode) {
       Address location_of_branch_data = reinterpret_cast<Address>(current);
       Assembler::deserialization_set_special_target_at(
-          isolate, location_of_branch_data,
+          location_of_branch_data,
           Code::cast(HeapObject::FromAddress(current_object_address)),
           reinterpret_cast<Address>(new_object));
       location_of_branch_data += Assembler::kSpecialTargetSize;

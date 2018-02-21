@@ -92,8 +92,6 @@ void MemoryOptimizer::VisitNode(Node* node, AllocationState const* state) {
       return VisitStoreElement(node, state);
     case IrOpcode::kStoreField:
       return VisitStoreField(node, state);
-    case IrOpcode::kCheckedLoad:
-    case IrOpcode::kCheckedStore:
     case IrOpcode::kDeoptimizeIf:
     case IrOpcode::kDeoptimizeUnless:
     case IrOpcode::kIfException:
@@ -231,9 +229,9 @@ void MemoryOptimizer::VisitAllocateRaw(Node* node,
                                      : __
                                        AllocateInOldSpaceStubConstant();
         if (!allocate_operator_.is_set()) {
-          CallDescriptor* descriptor =
+          auto call_descriptor =
               Linkage::GetAllocateCallDescriptor(graph()->zone());
-          allocate_operator_.set(common()->Call(descriptor));
+          allocate_operator_.set(common()->Call(call_descriptor));
         }
         Node* vfalse = __ Call(allocate_operator_.get(), target, size);
         vfalse = __ IntSub(vfalse, __ IntPtrConstant(kHeapObjectTag));
@@ -286,9 +284,9 @@ void MemoryOptimizer::VisitAllocateRaw(Node* node,
                                  : __
                                    AllocateInOldSpaceStubConstant();
     if (!allocate_operator_.is_set()) {
-      CallDescriptor* descriptor =
+      auto call_descriptor =
           Linkage::GetAllocateCallDescriptor(graph()->zone());
-      allocate_operator_.set(common()->Call(descriptor));
+      allocate_operator_.set(common()->Call(call_descriptor));
     }
     __ Goto(&done, __ Call(allocate_operator_.get(), target, size));
 
@@ -350,7 +348,13 @@ void MemoryOptimizer::VisitLoadElement(Node* node,
   ElementAccess const& access = ElementAccessOf(node->op());
   Node* index = node->InputAt(1);
   node->ReplaceInput(1, ComputeIndex(access, index));
-  NodeProperties::ChangeOp(node, machine()->Load(access.machine_type));
+  if (access.machine_type.representation() ==
+      MachineRepresentation::kTaggedPointer) {
+    NodeProperties::ChangeOp(node, machine()->Load(access.machine_type));
+  } else {
+    NodeProperties::ChangeOp(node,
+                             machine()->PoisonedLoad(access.machine_type));
+  }
   EnqueueUses(node, state);
 }
 
@@ -359,7 +363,13 @@ void MemoryOptimizer::VisitLoadField(Node* node, AllocationState const* state) {
   FieldAccess const& access = FieldAccessOf(node->op());
   Node* offset = jsgraph()->IntPtrConstant(access.offset - access.tag());
   node->InsertInput(graph()->zone(), 1, offset);
-  NodeProperties::ChangeOp(node, machine()->Load(access.machine_type));
+  if (access.machine_type.representation() ==
+      MachineRepresentation::kTaggedPointer) {
+    NodeProperties::ChangeOp(node, machine()->Load(access.machine_type));
+  } else {
+    NodeProperties::ChangeOp(node,
+                             machine()->PoisonedLoad(access.machine_type));
+  }
   EnqueueUses(node, state);
 }
 

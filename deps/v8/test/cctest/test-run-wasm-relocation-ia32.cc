@@ -40,7 +40,7 @@ TEST(WasmRelocationIa32ContextReference) {
   __ nop();
   __ ret(0);
 
-  compiler::CSignature0<int32_t> csig;
+  compiler::CSignatureOf<int32_t> csig;
   CodeDesc desc;
   assm.GetCode(isolate, &desc);
   Handle<Code> code =
@@ -68,8 +68,7 @@ TEST(WasmRelocationIa32ContextReference) {
     CodeSpaceMemoryModificationScope modification_scope(isolate->heap());
     DCHECK(RelocInfo::IsWasmContextReference(it.rinfo()->rmode()));
     it.rinfo()->set_wasm_context_reference(
-        isolate, it.rinfo()->wasm_context_reference() + offset,
-        SKIP_ICACHE_FLUSH);
+        it.rinfo()->wasm_context_reference() + offset, SKIP_ICACHE_FLUSH);
   }
 
   // Check if immediate is updated correctly

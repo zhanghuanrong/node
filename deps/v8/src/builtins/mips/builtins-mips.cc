@@ -110,11 +110,11 @@ void Builtins::Generate_InternalArrayConstructor(MacroAssembler* masm) {
     // Initial map for the builtin InternalArray functions should be maps.
     __ lw(a2, FieldMemOperand(a1, JSFunction::kPrototypeOrInitialMapOffset));
     __ SmiTst(a2, t0);
-    __ Assert(ne, kUnexpectedInitialMapForInternalArrayFunction, t0,
-              Operand(zero_reg));
+    __ Assert(ne, AbortReason::kUnexpectedInitialMapForInternalArrayFunction,
+              t0, Operand(zero_reg));
     __ GetObjectType(a2, a3, t0);
-    __ Assert(eq, kUnexpectedInitialMapForInternalArrayFunction, t0,
-              Operand(MAP_TYPE));
+    __ Assert(eq, AbortReason::kUnexpectedInitialMapForInternalArrayFunction,
+              t0, Operand(MAP_TYPE));
   }
 
   // Run the native code for the InternalArray function called as a normal
@@ -139,10 +139,10 @@ void Builtins::Generate_ArrayConstructor(MacroAssembler* masm) {
     // Initial map for the builtin Array functions should be maps.
     __ lw(a2, FieldMemOperand(a1, JSFunction::kPrototypeOrInitialMapOffset));
     __ SmiTst(a2, t0);
-    __ Assert(ne, kUnexpectedInitialMapForArrayFunction1, t0,
+    __ Assert(ne, AbortReason::kUnexpectedInitialMapForArrayFunction1, t0,
               Operand(zero_reg));
     __ GetObjectType(a2, a3, t0);
-    __ Assert(eq, kUnexpectedInitialMapForArrayFunction2, t0,
+    __ Assert(eq, AbortReason::kUnexpectedInitialMapForArrayFunction2, t0,
               Operand(MAP_TYPE));
   }
 
@@ -152,12 +152,6 @@ void Builtins::Generate_ArrayConstructor(MacroAssembler* masm) {
   __ LoadRoot(a2, Heap::kUndefinedValueRootIndex);
   ArrayConstructorStub stub(masm->isolate());
   __ TailCallStub(&stub);
-}
-
-static void GenerateTailCallToSharedCode(MacroAssembler* masm) {
-  __ lw(a2, FieldMemOperand(a1, JSFunction::kSharedFunctionInfoOffset));
-  __ lw(a2, FieldMemOperand(a2, SharedFunctionInfo::kCodeOffset));
-  __ Jump(at, a2, Code::kHeaderSize - kHeapObjectTag);
 }
 
 static void GenerateTailCallToReturnedCode(MacroAssembler* masm,
@@ -181,7 +175,9 @@ static void GenerateTailCallToReturnedCode(MacroAssembler* masm,
     __ SmiUntag(a0);
   }
 
-  __ Jump(at, v0, Code::kHeaderSize - kHeapObjectTag);
+  static_assert(kJavaScriptCallCodeStartRegister == a2, "ABI mismatch");
+  __ Addu(a2, v0, Code::kHeaderSize - kHeapObjectTag);
+  __ Jump(a2);
 }
 
 namespace {
@@ -271,13 +267,16 @@ void Generate_JSConstructStubGeneric(MacroAssembler* masm,
 
     // Preserve the incoming parameters on the stack.
     __ SmiTag(a0);
-    __ Push(cp, a0, a1, a3);
+    __ Push(cp, a0, a1);
+    __ PushRoot(Heap::kTheHoleValueRootIndex);
+    __ Push(a3);
 
     // ----------- S t a t e -------------
     //  --        sp[0*kPointerSize]: new target
-    //  -- a1 and sp[1*kPointerSize]: constructor function
-    //  --        sp[2*kPointerSize]: number of arguments (tagged)
-    //  --        sp[3*kPointerSize]: context
+    //  --        sp[1*kPointerSize]: padding
+    //  -- a1 and sp[2*kPointerSize]: constructor function
+    //  --        sp[3*kPointerSize]: number of arguments (tagged)
+    //  --        sp[4*kPointerSize]: context
     // -----------------------------------
 
     __ lw(t2, FieldMemOperand(a1, JSFunction::kSharedFunctionInfoOffset));
@@ -298,10 +297,11 @@ void Generate_JSConstructStubGeneric(MacroAssembler* masm,
 
     // ----------- S t a t e -------------
     //  --                          v0: receiver
-    //  -- Slot 3 / sp[0*kPointerSize]: new target
-    //  -- Slot 2 / sp[1*kPointerSize]: constructor function
-    //  -- Slot 1 / sp[2*kPointerSize]: number of arguments (tagged)
-    //  -- Slot 0 / sp[3*kPointerSize]: context
+    //  -- Slot 4 / sp[0*kPointerSize]: new target
+    //  -- Slot 3 / sp[1*kPointerSize]: padding
+    //  -- Slot 2 / sp[2*kPointerSize]: constructor function
+    //  -- Slot 1 / sp[3*kPointerSize]: number of arguments (tagged)
+    //  -- Slot 0 / sp[4*kPointerSize]: context
     // -----------------------------------
     // Deoptimizer enters here.
     masm->isolate()->heap()->SetConstructStubCreateDeoptPCOffset(
@@ -319,9 +319,10 @@ void Generate_JSConstructStubGeneric(MacroAssembler* masm,
     //  --                 r3: new target
     //  -- sp[0*kPointerSize]: implicit receiver
     //  -- sp[1*kPointerSize]: implicit receiver
-    //  -- sp[2*kPointerSize]: constructor function
-    //  -- sp[3*kPointerSize]: number of arguments (tagged)
-    //  -- sp[4*kPointerSize]: context
+    //  -- sp[2*kPointerSize]: padding
+    //  -- sp[3*kPointerSize]: constructor function
+    //  -- sp[4*kPointerSize]: number of arguments (tagged)
+    //  -- sp[5*kPointerSize]: context
     // -----------------------------------
 
     // Restore constructor function and argument count.
@@ -342,9 +343,10 @@ void Generate_JSConstructStubGeneric(MacroAssembler* masm,
     //  --                        t3: counter
     //  --        sp[0*kPointerSize]: implicit receiver
     //  --        sp[1*kPointerSize]: implicit receiver
-    //  -- a1 and sp[2*kPointerSize]: constructor function
-    //  --        sp[3*kPointerSize]: number of arguments (tagged)
-    //  --        sp[4*kPointerSize]: context
+    //  --        sp[2*kPointerSize]: padding
+    //  -- a1 and sp[3*kPointerSize]: constructor function
+    //  --        sp[4*kPointerSize]: number of arguments (tagged)
+    //  --        sp[5*kPointerSize]: context
     // -----------------------------------
     __ jmp(&entry);
     __ bind(&loop);
@@ -362,9 +364,10 @@ void Generate_JSConstructStubGeneric(MacroAssembler* masm,
     // ----------- S t a t e -------------
     //  --                 v0: constructor result
     //  -- sp[0*kPointerSize]: implicit receiver
-    //  -- sp[1*kPointerSize]: constructor function
-    //  -- sp[2*kPointerSize]: number of arguments
-    //  -- sp[3*kPointerSize]: context
+    //  -- sp[1*kPointerSize]: padding
+    //  -- sp[2*kPointerSize]: constructor function
+    //  -- sp[3*kPointerSize]: number of arguments
+    //  -- sp[4*kPointerSize]: context
     // -----------------------------------
 
     // Store offset of return address for deoptimizer.
@@ -635,7 +638,8 @@ void Builtins::Generate_ResumeGeneratorTrampoline(MacroAssembler* masm) {
     __ lw(a3, FieldMemOperand(t0, JSFunction::kSharedFunctionInfoOffset));
     __ lw(a3, FieldMemOperand(a3, SharedFunctionInfo::kFunctionDataOffset));
     __ GetObjectType(a3, a3, a3);
-    __ Assert(eq, kMissingBytecodeArray, a3, Operand(BYTECODE_ARRAY_TYPE));
+    __ Assert(eq, AbortReason::kMissingBytecodeArray, a3,
+              Operand(BYTECODE_ARRAY_TYPE));
   }
 
   // Resume (Ignition/TurboFan) generator object.
@@ -648,8 +652,10 @@ void Builtins::Generate_ResumeGeneratorTrampoline(MacroAssembler* masm) {
     // undefined because generator functions are non-constructable.
     __ Move(a3, a1);
     __ Move(a1, t0);
+    static_assert(kJavaScriptCallCodeStartRegister == a2, "ABI mismatch");
     __ lw(a2, FieldMemOperand(a1, JSFunction::kCodeOffset));
-    __ Jump(a2, Code::kHeaderSize - kHeapObjectTag);
+    __ Addu(a2, a2, Code::kHeaderSize - kHeapObjectTag);
+    __ Jump(a2);
   }
 
   __ bind(&prepare_step_in_if_stepping);
@@ -752,6 +758,9 @@ static void MaybeTailCallOptimizedCodeSlot(MacroAssembler* masm,
               Operand(Smi::FromEnum(OptimizationMarker::kNone)));
 
     TailCallRuntimeIfMarkerEquals(masm, optimized_code_entry,
+                                  OptimizationMarker::kLogFirstExecution,
+                                  Runtime::kFunctionFirstExecution);
+    TailCallRuntimeIfMarkerEquals(masm, optimized_code_entry,
                                   OptimizationMarker::kCompileOptimized,
                                   Runtime::kCompileOptimized_NotConcurrent);
     TailCallRuntimeIfMarkerEquals(
@@ -764,7 +773,8 @@ static void MaybeTailCallOptimizedCodeSlot(MacroAssembler* masm,
       // that an interrupt will eventually update the slot with optimized code.
       if (FLAG_debug_code) {
         __ Assert(
-            eq, kExpectedOptimizationSentinel, optimized_code_entry,
+            eq, AbortReason::kExpectedOptimizationSentinel,
+            optimized_code_entry,
             Operand(Smi::FromEnum(OptimizationMarker::kInOptimizationQueue)));
       }
       __ jmp(&fallthrough);
@@ -795,7 +805,9 @@ static void MaybeTailCallOptimizedCodeSlot(MacroAssembler* masm,
     // register.
     ReplaceClosureCodeWithOptimizedCode(masm, optimized_code_entry, closure,
                                         scratch2, scratch3, feedback_vector);
-    __ Jump(optimized_code_entry, Code::kHeaderSize - kHeapObjectTag);
+    static_assert(kJavaScriptCallCodeStartRegister == a2, "ABI mismatch");
+    __ Addu(a2, optimized_code_entry, Code::kHeaderSize - kHeapObjectTag);
+    __ Jump(a2);
 
     // Optimized code slot contains deoptimized code, evict it and re-enter the
     // losure's code.
@@ -809,10 +821,13 @@ static void MaybeTailCallOptimizedCodeSlot(MacroAssembler* masm,
 }
 
 // Advance the current bytecode offset. This simulates what all bytecode
-// handlers do upon completion of the underlying operation.
-static void AdvanceBytecodeOffset(MacroAssembler* masm, Register bytecode_array,
-                                  Register bytecode_offset, Register bytecode,
-                                  Register scratch1, Register scratch2) {
+// handlers do upon completion of the underlying operation. Will bail out to a
+// label if the bytecode (without prefix) is a return bytecode.
+static void AdvanceBytecodeOffsetOrReturn(MacroAssembler* masm,
+                                          Register bytecode_array,
+                                          Register bytecode_offset,
+                                          Register bytecode, Register scratch1,
+                                          Register scratch2, Label* if_return) {
   Register bytecode_size_table = scratch1;
   DCHECK(!AreAliased(bytecode_array, bytecode_offset, bytecode_size_table,
                      bytecode));
@@ -822,10 +837,10 @@ static void AdvanceBytecodeOffset(MacroAssembler* masm, Register bytecode_array,
       Operand(ExternalReference::bytecode_size_table_address(masm->isolate())));
 
   // Check if the bytecode is a Wide or ExtraWide prefix bytecode.
-  Label load_size, extra_wide;
+  Label process_bytecode, extra_wide;
   STATIC_ASSERT(0 == static_cast<int>(interpreter::Bytecode::kWide));
   STATIC_ASSERT(1 == static_cast<int>(interpreter::Bytecode::kExtraWide));
-  __ Branch(&load_size, hi, bytecode, Operand(1));
+  __ Branch(&process_bytecode, hi, bytecode, Operand(1));
   __ Branch(&extra_wide, eq, bytecode, Operand(1));
 
   // Load the next bytecode and update table to the wide scaled table.
@@ -834,7 +849,7 @@ static void AdvanceBytecodeOffset(MacroAssembler* masm, Register bytecode_array,
   __ lbu(bytecode, MemOperand(scratch2));
   __ Addu(bytecode_size_table, bytecode_size_table,
           Operand(kIntSize * interpreter::Bytecodes::kBytecodeCount));
-  __ jmp(&load_size);
+  __ jmp(&process_bytecode);
 
   __ bind(&extra_wide);
   // Load the next bytecode and update table to the extra wide scaled table.
@@ -843,10 +858,17 @@ static void AdvanceBytecodeOffset(MacroAssembler* masm, Register bytecode_array,
   __ lbu(bytecode, MemOperand(scratch2));
   __ Addu(bytecode_size_table, bytecode_size_table,
           Operand(2 * kIntSize * interpreter::Bytecodes::kBytecodeCount));
-  __ jmp(&load_size);
 
-  // Load the size of the current bytecode.
-  __ bind(&load_size);
+  __ bind(&process_bytecode);
+
+// Bailout to the return label if this is a return bytecode.
+#define JUMP_IF_EQUAL(NAME)          \
+  __ Branch(if_return, eq, bytecode, \
+            Operand(static_cast<int>(interpreter::Bytecode::k##NAME)));
+  RETURN_BYTECODE_LIST(JUMP_IF_EQUAL)
+#undef JUMP_IF_EQUAL
+
+  // Otherwise, load the size of the current bytecode and advance the offset.
   __ Lsa(scratch2, bytecode_size_table, bytecode, 2);
   __ lw(scratch2, MemOperand(scratch2));
   __ Addu(bytecode_offset, bytecode_offset, scratch2);
@@ -907,11 +929,13 @@ void Builtins::Generate_InterpreterEntryTrampoline(MacroAssembler* masm) {
   // Check function data field is actually a BytecodeArray object.
   if (FLAG_debug_code) {
     __ SmiTst(kInterpreterBytecodeArrayRegister, t0);
-    __ Assert(ne, kFunctionDataShouldBeBytecodeArrayOnInterpreterEntry, t0,
-              Operand(zero_reg));
+    __ Assert(ne,
+              AbortReason::kFunctionDataShouldBeBytecodeArrayOnInterpreterEntry,
+              t0, Operand(zero_reg));
     __ GetObjectType(kInterpreterBytecodeArrayRegister, t0, t0);
-    __ Assert(eq, kFunctionDataShouldBeBytecodeArrayOnInterpreterEntry, t0,
-              Operand(BYTECODE_ARRAY_TYPE));
+    __ Assert(eq,
+              AbortReason::kFunctionDataShouldBeBytecodeArrayOnInterpreterEntry,
+              t0, Operand(BYTECODE_ARRAY_TYPE));
   }
 
   // Reset code age.
@@ -979,10 +1003,10 @@ void Builtins::Generate_InterpreterEntryTrampoline(MacroAssembler* masm) {
             masm->isolate())));
   __ Addu(a0, kInterpreterBytecodeArrayRegister,
           kInterpreterBytecodeOffsetRegister);
-  __ lbu(a0, MemOperand(a0));
-  __ Lsa(at, kInterpreterDispatchTableRegister, a0, kPointerSizeLog2);
-  __ lw(at, MemOperand(at));
-  __ Call(at);
+  __ lbu(t3, MemOperand(a0));
+  __ Lsa(at, kInterpreterDispatchTableRegister, t3, kPointerSizeLog2);
+  __ lw(kJavaScriptCallCodeStartRegister, MemOperand(at));
+  __ Call(kJavaScriptCallCodeStartRegister);
   masm->isolate()->heap()->SetInterpreterEntryReturnPCOffset(masm->pc_offset());
 
   // Any returns to the entry trampoline are either due to the return bytecode
@@ -994,18 +1018,14 @@ void Builtins::Generate_InterpreterEntryTrampoline(MacroAssembler* masm) {
   __ lw(kInterpreterBytecodeOffsetRegister,
         MemOperand(fp, InterpreterFrameConstants::kBytecodeOffsetFromFp));
   __ SmiUntag(kInterpreterBytecodeOffsetRegister);
-
-  // Check if we should return.
+  // Either return, or advance to the next bytecode and dispatch.
   Label do_return;
   __ Addu(a1, kInterpreterBytecodeArrayRegister,
           kInterpreterBytecodeOffsetRegister);
   __ lbu(a1, MemOperand(a1));
-  __ Branch(&do_return, eq, a1,
-            Operand(static_cast<int>(interpreter::Bytecode::kReturn)));
-
-  // Advance to the next bytecode and dispatch.
-  AdvanceBytecodeOffset(masm, kInterpreterBytecodeArrayRegister,
-                        kInterpreterBytecodeOffsetRegister, a1, a2, a3);
+  AdvanceBytecodeOffsetOrReturn(masm, kInterpreterBytecodeArrayRegister,
+                                kInterpreterBytecodeOffsetRegister, a1, a2, a3,
+                                &do_return);
   __ jmp(&do_dispatch);
 
   __ bind(&do_return);
@@ -1189,11 +1209,13 @@ static void Generate_InterpreterEnterBytecode(MacroAssembler* masm) {
   if (FLAG_debug_code) {
     // Check function data field is actually a BytecodeArray object.
     __ SmiTst(kInterpreterBytecodeArrayRegister, at);
-    __ Assert(ne, kFunctionDataShouldBeBytecodeArrayOnInterpreterEntry, at,
-              Operand(zero_reg));
+    __ Assert(ne,
+              AbortReason::kFunctionDataShouldBeBytecodeArrayOnInterpreterEntry,
+              at, Operand(zero_reg));
     __ GetObjectType(kInterpreterBytecodeArrayRegister, a1, a1);
-    __ Assert(eq, kFunctionDataShouldBeBytecodeArrayOnInterpreterEntry, a1,
-              Operand(BYTECODE_ARRAY_TYPE));
+    __ Assert(eq,
+              AbortReason::kFunctionDataShouldBeBytecodeArrayOnInterpreterEntry,
+              a1, Operand(BYTECODE_ARRAY_TYPE));
   }
 
   // Get the target bytecode offset from the frame.
@@ -1204,10 +1226,10 @@ static void Generate_InterpreterEnterBytecode(MacroAssembler* masm) {
   // Dispatch to the target bytecode.
   __ Addu(a1, kInterpreterBytecodeArrayRegister,
           kInterpreterBytecodeOffsetRegister);
-  __ lbu(a1, MemOperand(a1));
-  __ Lsa(a1, kInterpreterDispatchTableRegister, a1, kPointerSizeLog2);
-  __ lw(a1, MemOperand(a1));
-  __ Jump(a1);
+  __ lbu(t3, MemOperand(a1));
+  __ Lsa(a1, kInterpreterDispatchTableRegister, t3, kPointerSizeLog2);
+  __ lw(kJavaScriptCallCodeStartRegister, MemOperand(a1));
+  __ Jump(kJavaScriptCallCodeStartRegister);
 }
 
 void Builtins::Generate_InterpreterEnterBytecodeAdvance(MacroAssembler* masm) {
@@ -1226,14 +1248,20 @@ void Builtins::Generate_InterpreterEnterBytecodeAdvance(MacroAssembler* masm) {
   __ lbu(a1, MemOperand(a1));
 
   // Advance to the next bytecode.
-  AdvanceBytecodeOffset(masm, kInterpreterBytecodeArrayRegister,
-                        kInterpreterBytecodeOffsetRegister, a1, a2, a3);
+  Label if_return;
+  AdvanceBytecodeOffsetOrReturn(masm, kInterpreterBytecodeArrayRegister,
+                                kInterpreterBytecodeOffsetRegister, a1, a2, a3,
+                                &if_return);
 
   // Convert new bytecode offset to a Smi and save in the stackframe.
   __ SmiTag(a2, kInterpreterBytecodeOffsetRegister);
   __ sw(a2, MemOperand(fp, InterpreterFrameConstants::kBytecodeOffsetFromFp));
 
   Generate_InterpreterEnterBytecode(masm);
+
+  // We should never take the if_return path.
+  __ bind(&if_return);
+  __ Abort(AbortReason::kInvalidBytecodeAdvance);
 }
 
 void Builtins::Generate_InterpreterEnterBytecodeDispatch(MacroAssembler* masm) {
@@ -1257,7 +1285,7 @@ void Builtins::Generate_CheckOptimizationMarker(MacroAssembler* masm) {
   // The feedback vector must be defined.
   if (FLAG_debug_code) {
     __ LoadRoot(at, Heap::kUndefinedValueRootIndex);
-    __ Assert(ne, BailoutReason::kExpectedFeedbackVector, feedback_vector,
+    __ Assert(ne, AbortReason::kExpectedFeedbackVector, feedback_vector,
               Operand(at));
   }
 
@@ -1265,7 +1293,11 @@ void Builtins::Generate_CheckOptimizationMarker(MacroAssembler* masm) {
   MaybeTailCallOptimizedCodeSlot(masm, feedback_vector, t0, t3, t1);
 
   // Otherwise, tail call the SFI code.
-  GenerateTailCallToSharedCode(masm);
+  static_assert(kJavaScriptCallCodeStartRegister == a2, "ABI mismatch");
+  __ lw(a2, FieldMemOperand(a1, JSFunction::kSharedFunctionInfoOffset));
+  __ lw(a2, FieldMemOperand(a2, SharedFunctionInfo::kCodeOffset));
+  __ Addu(a2, a2, Code::kHeaderSize - kHeapObjectTag);
+  __ Jump(a2);
 }
 
 void Builtins::Generate_CompileLazyDeoptimizedCode(MacroAssembler* masm) {
@@ -1469,8 +1501,10 @@ void Builtins::Generate_InstantiateAsmJs(MacroAssembler* masm) {
   }
   // On failure, tail call back to regular js by re-calling the function
   // which has be reset to the compile lazy builtin.
-  __ lw(t0, FieldMemOperand(a1, JSFunction::kCodeOffset));
-  __ Jump(t0, Code::kHeaderSize - kHeapObjectTag);
+  static_assert(kJavaScriptCallCodeStartRegister == a2, "ABI mismatch");
+  __ lw(a2, FieldMemOperand(a1, JSFunction::kCodeOffset));
+  __ Addu(a2, a2, Code::kHeaderSize - kHeapObjectTag);
+  __ Jump(a2);
 }
 
 namespace {
@@ -1804,8 +1838,9 @@ static void EnterArgumentsAdaptorFrame(MacroAssembler* masm) {
   __ sll(a0, a0, kSmiTagSize);
   __ li(t0, Operand(StackFrame::TypeToMarker(StackFrame::ARGUMENTS_ADAPTOR)));
   __ MultiPush(a0.bit() | a1.bit() | t0.bit() | fp.bit() | ra.bit());
-  __ Addu(fp, sp, Operand(StandardFrameConstants::kFixedFrameSizeFromFp +
-                          kPointerSize));
+  __ Push(Smi::kZero);  // Padding.
+  __ Addu(fp, sp,
+          Operand(ArgumentsAdaptorFrameConstants::kFixedFrameSizeFromFp));
 }
 
 static void LeaveArgumentsAdaptorFrame(MacroAssembler* masm) {
@@ -1814,8 +1849,7 @@ static void LeaveArgumentsAdaptorFrame(MacroAssembler* masm) {
   // -----------------------------------
   // Get the number of arguments passed (as a smi), tear down the frame and
   // then tear down the parameters.
-  __ lw(a1, MemOperand(fp, -(StandardFrameConstants::kFixedFrameSizeFromFp +
-                             kPointerSize)));
+  __ lw(a1, MemOperand(fp, ArgumentsAdaptorFrameConstants::kLengthOffset));
   __ mov(sp, fp);
   __ MultiPop(fp.bit() | ra.bit());
   __ Lsa(sp, sp, a1, kPointerSizeLog2 - kSmiTagSize);
@@ -1891,7 +1925,7 @@ void Builtins::Generate_CallOrConstructForwardVarargs(MacroAssembler* masm,
     __ JumpIfSmi(a3, &new_target_not_constructor);
     __ lw(t1, FieldMemOperand(a3, HeapObject::kMapOffset));
     __ lbu(t1, FieldMemOperand(t1, Map::kBitFieldOffset));
-    __ And(t1, t1, Operand(1 << Map::kIsConstructor));
+    __ And(t1, t1, Operand(Map::IsConstructorBit::kMask));
     __ Branch(&new_target_constructor, ne, t1, Operand(zero_reg));
     __ bind(&new_target_not_constructor);
     {
@@ -2165,7 +2199,7 @@ void Builtins::Generate_Call(MacroAssembler* masm, ConvertReceiverMode mode) {
 
   // Check if target has a [[Call]] internal method.
   __ lbu(t1, FieldMemOperand(t1, Map::kBitFieldOffset));
-  __ And(t1, t1, Operand(1 << Map::kIsCallable));
+  __ And(t1, t1, Operand(Map::IsCallableBit::kMask));
   __ Branch(&non_callable, eq, t1, Operand(zero_reg));
 
   // Check if target is a proxy and call CallProxy external builtin
@@ -2321,7 +2355,7 @@ void Builtins::Generate_Construct(MacroAssembler* masm) {
 
   // Check if target has a [[Construct]] internal method.
   __ lbu(t3, FieldMemOperand(t1, Map::kBitFieldOffset));
-  __ And(t3, t3, Operand(1 << Map::kIsConstructor));
+  __ And(t3, t3, Operand(Map::IsConstructorBit::kMask));
   __ Branch(&non_constructor, eq, t3, Operand(zero_reg));
 
   // Only dispatch to bound functions after checking whether they are
@@ -2387,17 +2421,6 @@ void Builtins::Generate_Abort(MacroAssembler* masm) {
   __ Push(a0);
   __ Move(cp, Smi::kZero);
   __ TailCallRuntime(Runtime::kAbort);
-}
-
-// static
-void Builtins::Generate_AbortJS(MacroAssembler* masm) {
-  // ----------- S t a t e -------------
-  //  -- a0 : message as String object
-  //  -- ra : return address
-  // -----------------------------------
-  __ Push(a0);
-  __ Move(cp, Smi::kZero);
-  __ TailCallRuntime(Runtime::kAbortJS);
 }
 
 void Builtins::Generate_ArgumentsAdaptorTrampoline(MacroAssembler* masm) {
@@ -2489,8 +2512,9 @@ void Builtins::Generate_ArgumentsAdaptorTrampoline(MacroAssembler* masm) {
     __ sll(t2, a2, kPointerSizeLog2);
     __ Subu(t1, fp, Operand(t2));
     // Adjust for frame.
-    __ Subu(t1, t1, Operand(StandardFrameConstants::kFixedFrameSizeFromFp +
-                            2 * kPointerSize));
+    __ Subu(t1, t1,
+            Operand(ArgumentsAdaptorFrameConstants::kFixedFrameSizeFromFp +
+                    kPointerSize));
 
     Label fill;
     __ bind(&fill);
@@ -2505,8 +2529,10 @@ void Builtins::Generate_ArgumentsAdaptorTrampoline(MacroAssembler* masm) {
   // a0 : expected number of arguments
   // a1 : function (passed through to callee)
   // a3 : new target (passed through to callee)
-  __ lw(t0, FieldMemOperand(a1, JSFunction::kCodeOffset));
-  __ Call(t0, Code::kHeaderSize - kHeapObjectTag);
+  static_assert(kJavaScriptCallCodeStartRegister == a2, "ABI mismatch");
+  __ lw(a2, FieldMemOperand(a1, JSFunction::kCodeOffset));
+  __ Addu(a2, a2, Code::kHeaderSize - kHeapObjectTag);
+  __ Call(a2);
 
   // Store offset of return address for deoptimizer.
   masm->isolate()->heap()->SetArgumentsAdaptorDeoptPCOffset(masm->pc_offset());
@@ -2519,8 +2545,10 @@ void Builtins::Generate_ArgumentsAdaptorTrampoline(MacroAssembler* masm) {
   // Don't adapt arguments.
   // -------------------------------------------
   __ bind(&dont_adapt_arguments);
-  __ lw(t0, FieldMemOperand(a1, JSFunction::kCodeOffset));
-  __ Jump(t0, Code::kHeaderSize - kHeapObjectTag);
+  static_assert(kJavaScriptCallCodeStartRegister == a2, "ABI mismatch");
+  __ lw(a2, FieldMemOperand(a1, JSFunction::kCodeOffset));
+  __ Addu(a2, a2, Code::kHeaderSize - kHeapObjectTag);
+  __ Jump(a2);
 
   __ bind(&stack_overflow);
   {

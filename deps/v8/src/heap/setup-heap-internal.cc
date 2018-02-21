@@ -17,6 +17,7 @@
 #include "src/lookup-cache.h"
 #include "src/objects-inl.h"
 #include "src/objects/arguments.h"
+#include "src/objects/data-handler.h"
 #include "src/objects/debug-objects.h"
 #include "src/objects/descriptor-array.h"
 #include "src/objects/dictionary.h"
@@ -69,6 +70,11 @@ const Heap::StructTable Heap::struct_table[] = {
   {NAME##_TYPE, Name::kSize, k##Name##MapRootIndex},
     STRUCT_LIST(STRUCT_TABLE_ELEMENT)
 #undef STRUCT_TABLE_ELEMENT
+
+#define DATA_HANDLER_ELEMENT(NAME, Name, Size, name) \
+  {NAME##_TYPE, Name::kSizeWithData##Size, k##Name##Size##MapRootIndex},
+        DATA_HANDLER_LIST(DATA_HANDLER_ELEMENT)
+#undef DATA_HANDLER_ELEMENT
 };
 
 namespace {
@@ -188,9 +194,9 @@ bool Heap::CreateInitialMaps() {
   FinalizePartialMap(this, fixed_cow_array_map());
   FinalizePartialMap(this, descriptor_array_map());
   FinalizePartialMap(this, undefined_map());
-  undefined_map()->set_is_undetectable();
+  undefined_map()->set_is_undetectable(true);
   FinalizePartialMap(this, null_map());
-  null_map()->set_is_undetectable();
+  null_map()->set_is_undetectable(true);
   FinalizePartialMap(this, the_hole_map());
   for (unsigned i = 0; i < arraysize(struct_table); ++i) {
     const StructTable& entry = struct_table[i];
@@ -216,7 +222,7 @@ bool Heap::CreateInitialMaps() {
           (constructor_function_index));                          \
     }
 
-    ALLOCATE_VARSIZE_MAP(FIXED_ARRAY_TYPE, scope_info)
+    ALLOCATE_VARSIZE_MAP(SCOPE_INFO_TYPE, scope_info)
     ALLOCATE_VARSIZE_MAP(FIXED_ARRAY_TYPE, module_info)
     ALLOCATE_VARSIZE_MAP(FEEDBACK_VECTOR_TYPE, feedback_vector)
     ALLOCATE_PRIMITIVE_MAP(HEAP_NUMBER_TYPE, HeapNumber::kSize, heap_number,
@@ -297,8 +303,11 @@ bool Heap::CreateInitialMaps() {
     ALLOCATE_VARSIZE_MAP(HASH_TABLE_TYPE, name_dictionary)
     ALLOCATE_VARSIZE_MAP(HASH_TABLE_TYPE, global_dictionary)
     ALLOCATE_VARSIZE_MAP(HASH_TABLE_TYPE, number_dictionary)
+    ALLOCATE_VARSIZE_MAP(HASH_TABLE_TYPE, simple_number_dictionary)
     ALLOCATE_VARSIZE_MAP(HASH_TABLE_TYPE, string_table)
     ALLOCATE_VARSIZE_MAP(HASH_TABLE_TYPE, weak_hash_table)
+
+    ALLOCATE_VARSIZE_MAP(FIXED_ARRAY_TYPE, array_list)
 
     ALLOCATE_VARSIZE_MAP(FIXED_ARRAY_TYPE, function_context)
     ALLOCATE_VARSIZE_MAP(FIXED_ARRAY_TYPE, catch_context)
@@ -467,7 +476,7 @@ void Heap::CreateInitialObjects() {
 
   // Create the code_stubs dictionary. The initial size is set to avoid
   // expanding the dictionary during bootstrapping.
-  set_code_stubs(*NumberDictionary::New(isolate(), 128));
+  set_code_stubs(*SimpleNumberDictionary::New(isolate(), 128));
 
   {
     HandleScope scope(isolate());
@@ -551,9 +560,7 @@ void Heap::CreateInitialObjects() {
 
   set_weak_object_to_code_table(*WeakHashTable::New(isolate(), 16, TENURED));
 
-  set_weak_new_space_object_to_code_list(
-      ArrayList::cast(*(factory->NewFixedArray(16, TENURED))));
-  weak_new_space_object_to_code_list()->SetLength(0);
+  set_weak_new_space_object_to_code_list(*ArrayList::New(isolate(), 16));
 
   set_feedback_vectors_for_profiling_tools(undefined_value());
 
@@ -632,7 +639,15 @@ void Heap::CreateInitialObjects() {
   cell->set_value(Smi::FromInt(Isolate::kProtectorValid));
   set_array_buffer_neutering_protector(*cell);
 
-  set_serialized_templates(empty_fixed_array());
+  cell = factory->NewPropertyCell(factory->empty_string());
+  cell->set_value(Smi::FromInt(Isolate::kProtectorValid));
+  set_promise_hook_protector(*cell);
+
+  cell = factory->NewPropertyCell(factory->empty_string());
+  cell->set_value(Smi::FromInt(Isolate::kProtectorValid));
+  set_promise_then_protector(*cell);
+
+  set_serialized_objects(empty_fixed_array());
   set_serialized_global_proxy_sizes(empty_fixed_array());
 
   set_weak_stack_trace_list(Smi::kZero);

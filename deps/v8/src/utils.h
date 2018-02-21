@@ -18,6 +18,7 @@
 #include "src/base/logging.h"
 #include "src/base/macros.h"
 #include "src/base/platform/platform.h"
+#include "src/base/v8-fallthrough.h"
 #include "src/globals.h"
 #include "src/vector.h"
 #include "src/zone/zone.h"
@@ -79,9 +80,15 @@ inline int WhichPowerOf2(T x) {
 #undef CHECK_BIGGER
   switch (x) {
     default: UNREACHABLE();
-    case 8: bits++;  // Fall through.
-    case 4: bits++;  // Fall through.
-    case 2: bits++;  // Fall through.
+    case 8:
+      bits++;
+      V8_FALLTHROUGH;
+    case 4:
+      bits++;
+      V8_FALLTHROUGH;
+    case 2:
+      bits++;
+      V8_FALLTHROUGH;
     case 1: break;
   }
   DCHECK_EQ(T{1} << bits, original_x);
@@ -384,9 +391,9 @@ class BitField64 : public BitFieldBase<T, shift, size, uint64_t> { };
 #define DEFINE_BIT_FIELD_RANGE_TYPE(Name, Type, Size, _) \
   k##Name##Start, k##Name##End = k##Name##Start + Size - 1,
 
-#define DEFINE_BIT_RANGES(LIST_MACRO)                    \
-  struct LIST_MACRO##_Ranges {                           \
-    enum { LIST_MACRO(DEFINE_BIT_FIELD_RANGE_TYPE, _) }; \
+#define DEFINE_BIT_RANGES(LIST_MACRO)                               \
+  struct LIST_MACRO##_Ranges {                                      \
+    enum { LIST_MACRO(DEFINE_BIT_FIELD_RANGE_TYPE, _) kBitsCount }; \
   };
 
 #define DEFINE_BIT_FIELD_TYPE(Name, Type, Size, RangesName) \
@@ -641,7 +648,7 @@ class Access {
 template<typename T>
 class SetOncePointer {
  public:
-  SetOncePointer() : pointer_(nullptr) {}
+  SetOncePointer() = default;
 
   bool is_set() const { return pointer_ != nullptr; }
 
@@ -655,8 +662,16 @@ class SetOncePointer {
     pointer_ = value;
   }
 
+  T* operator=(T* value) {
+    set(value);
+    return value;
+  }
+
+  bool operator==(std::nullptr_t) const { return pointer_ == nullptr; }
+  bool operator!=(std::nullptr_t) const { return pointer_ != nullptr; }
+
  private:
-  T* pointer_;
+  T* pointer_ = nullptr;
 };
 
 

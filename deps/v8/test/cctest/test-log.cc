@@ -53,6 +53,10 @@ using v8::internal::EmbeddedVector;
 using v8::internal::Logger;
 using v8::internal::StrLength;
 
+namespace internal {
+class InstructionStream;
+}
+
 namespace {
 
 
@@ -648,14 +652,12 @@ TEST(EquivalenceOfLoggingAndTraversal) {
     v8::Local<v8::Script> script = CompileWithOrigin(source_str, "");
     if (script.IsEmpty()) {
       v8::String::Utf8Value exception(isolate, try_catch.Exception());
-      printf("compile: %s\n", *exception);
-      CHECK(false);
+      FATAL("compile: %s\n", *exception);
     }
     v8::Local<v8::Value> result;
     if (!script->Run(logger.env()).ToLocal(&result)) {
       v8::String::Utf8Value exception(isolate, try_catch.Exception());
-      printf("run: %s\n", *exception);
-      CHECK(false);
+      FATAL("run: %s\n", *exception);
     }
     // The result either be the "true" literal or problem description.
     if (!result->IsTrue()) {
@@ -663,10 +665,7 @@ TEST(EquivalenceOfLoggingAndTraversal) {
       i::ScopedVector<char> data(s->Utf8Length() + 1);
       CHECK(data.start());
       s->WriteUtf8(data.start());
-      printf("%s\n", data.start());
-      // Make sure that our output is written prior crash due to CHECK failure.
-      fflush(stdout);
-      CHECK(false);
+      FATAL("%s\n", data.start());
     }
   }
   isolate->Dispose();
@@ -704,6 +703,10 @@ TEST(Issue539892) {
    private:
     void LogRecordedBuffer(i::AbstractCode* code, i::SharedFunctionInfo* shared,
                            const char* name, int length) override {}
+    void LogRecordedBuffer(const i::InstructionStream* stream, const char* name,
+                           int length) override {}
+    void LogRecordedBuffer(i::wasm::WasmCode* code, const char* name,
+                           int length) override {}
   } code_event_logger;
   SETUP_FLAGS();
   v8::Isolate::CreateParams create_params;
@@ -885,6 +888,9 @@ TEST(ConsoleTimeEvents) {
 }
 
 TEST(LogFunctionEvents) {
+  // Always opt and stress opt will break the fine-grained log order.
+  if (i::FLAG_always_opt) return;
+
   SETUP_FLAGS();
   i::FLAG_log_function_events = true;
   v8::Isolate::CreateParams create_params;
@@ -936,14 +942,21 @@ TEST(LogFunctionEvents) {
         //         - execute eager functions.
         {"function,parse-function,", ",lazyFunction"},
         {"function,compile-lazy,", ",lazyFunction"},
+        {"function,first-execution,", ",lazyFunction"},
 
         {"function,parse-function,", ",lazyInnerFunction"},
         {"function,compile-lazy,", ",lazyInnerFunction"},
+        {"function,first-execution,", ",lazyInnerFunction"},
+
+        {"function,first-execution,", ",eagerFunction"},
 
         {"function,parse-function,", ",Foo"},
         {"function,compile-lazy,", ",Foo"},
+        {"function,first-execution,", ",Foo"},
+
         {"function,parse-function,", ",Foo.foo"},
         {"function,compile-lazy,", ",Foo.foo"},
+        {"function,first-execution,", ",Foo.foo"},
     };
     logger.FindLogLines(pairs, arraysize(pairs), start);
   }

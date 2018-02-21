@@ -13,6 +13,7 @@
 #include "src/interpreter/bytecode-label.h"
 #include "src/interpreter/bytecode-register-allocator.h"
 #include "src/objects-inl.h"
+#include "test/unittests/interpreter/bytecode-utils.h"
 #include "test/unittests/test-utils.h"
 
 namespace v8 {
@@ -41,8 +42,11 @@ TEST_F(BytecodeArrayBuilderTest, AllBytecodesGenerated) {
   Register reg(0);
   Register other(reg.index() + 1);
   Register wide(128);
-  RegisterList reg_list(0, 10);
-  RegisterList empty, single(0, 1), pair(0, 2), triple(0, 3);
+  RegisterList empty;
+  RegisterList single = BytecodeUtils::NewRegisterList(0, 1);
+  RegisterList pair = BytecodeUtils::NewRegisterList(0, 2);
+  RegisterList triple = BytecodeUtils::NewRegisterList(0, 3);
+  RegisterList reg_list = BytecodeUtils::NewRegisterList(0, 10);
 
   // Emit argument creation operations.
   builder.CreateArguments(CreateArgumentsType::kMappedArguments)
@@ -89,8 +93,6 @@ TEST_F(BytecodeArrayBuilderTest, AllBytecodesGenerated) {
       feedback_spec.AddLoadGlobalICSlot(INSIDE_TYPEOF);
   FeedbackSlot sloppy_store_global_slot =
       feedback_spec.AddStoreGlobalICSlot(LanguageMode::kSloppy);
-  FeedbackSlot strict_store_global_slot =
-      feedback_spec.AddStoreGlobalICSlot(LanguageMode::kStrict);
   FeedbackSlot load_slot = feedback_spec.AddLoadICSlot();
   FeedbackSlot keyed_load_slot = feedback_spec.AddKeyedLoadICSlot();
   FeedbackSlot sloppy_store_slot =
@@ -109,10 +111,7 @@ TEST_F(BytecodeArrayBuilderTest, AllBytecodesGenerated) {
       .LoadGlobal(name, load_global_slot.ToInt(), TypeofMode::NOT_INSIDE_TYPEOF)
       .LoadGlobal(name, load_global_typeof_slot.ToInt(),
                   TypeofMode::INSIDE_TYPEOF)
-      .StoreGlobal(name, sloppy_store_global_slot.ToInt(),
-                   LanguageMode::kSloppy)
-      .StoreGlobal(name, strict_store_global_slot.ToInt(),
-                   LanguageMode::kStrict);
+      .StoreGlobal(name, sloppy_store_global_slot.ToInt());
 
   // Emit context operations.
   builder.PushContext(reg)
@@ -177,7 +176,7 @@ TEST_F(BytecodeArrayBuilderTest, AllBytecodesGenerated) {
   builder.CreateObjectLiteral(0, 0, 0, reg);
 
   // Emit tagged template operations.
-  builder.GetTemplateObject(0);
+  builder.GetTemplateObject(0, 0);
 
   // Call operations.
   builder.CallAnyReceiver(reg, reg_list, 1)
@@ -385,9 +384,17 @@ TEST_F(BytecodeArrayBuilderTest, AllBytecodesGenerated) {
       .StoreModuleVariable(1, 42);
 
   // Emit generator operations.
-  builder.SuspendGenerator(reg, reg_list, 0)
-      .RestoreGeneratorState(reg)
-      .RestoreGeneratorRegisters(reg, reg_list);
+  {
+    // We have to skip over suspend because it returns and marks the remaining
+    // bytecode dead.
+    BytecodeLabel after_suspend;
+    builder.JumpIfTrue(ToBooleanMode::kAlreadyBoolean, &after_suspend)
+        .SuspendGenerator(reg, reg_list, 0)
+        .Bind(&after_suspend)
+        .ResumeGenerator(reg, reg_list);
+  }
+  BytecodeJumpTable* gen_jump_table = builder.AllocateJumpTable(1, 0);
+  builder.SwitchOnGeneratorState(reg, gen_jump_table).Bind(gen_jump_table, 0);
 
   // Intrinsics handled by the interpreter.
   builder.CallRuntime(Runtime::kInlineIsArray, reg_list);
@@ -398,7 +405,7 @@ TEST_F(BytecodeArrayBuilderTest, AllBytecodesGenerated) {
   // Emit abort bytecode.
   {
     BytecodeLabel after;
-    builder.Abort(kGenerator).Bind(&after);
+    builder.Abort(AbortReason::kOperandIsASmi).Bind(&after);
   }
 
   // Insert dummy ops to force longer jumps.
@@ -439,6 +446,7 @@ TEST_F(BytecodeArrayBuilderTest, AllBytecodesGenerated) {
       operand_scale = Bytecodes::PrefixBytecodeToOperandScale(final_bytecode);
       prefix_offset = 1;
       code = the_array->get(i + 1);
+      scorecard[code] += 1;
       final_bytecode = Bytecodes::FromByte(code);
     }
     i += prefix_offset + Bytecodes::Size(final_bytecode, operand_scale);
@@ -458,7 +466,7 @@ TEST_F(BytecodeArrayBuilderTest, AllBytecodesGenerated) {
 #define CHECK_BYTECODE_PRESENT(Name, ...)                                \
   /* Check Bytecode is marked in scorecard, unless it's a debug break */ \
   if (!Bytecodes::IsDebugBreak(Bytecode::k##Name)) {                     \
-    CHECK_GE(scorecard[Bytecodes::ToByte(Bytecode::k##Name)], 1);        \
+    EXPECT_GE(scorecard[Bytecodes::ToByte(Bytecode::k##Name)], 1);       \
   }
   BYTECODE_LIST(CHECK_BYTECODE_PRESENT)
 #undef CHECK_BYTECODE_PRESENT

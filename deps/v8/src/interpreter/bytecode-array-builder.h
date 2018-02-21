@@ -85,8 +85,8 @@ class V8_EXPORT_PRIVATE BytecodeArrayBuilder final {
   // Global loads to the accumulator and stores from the accumulator.
   BytecodeArrayBuilder& LoadGlobal(const AstRawString* name, int feedback_slot,
                                    TypeofMode typeof_mode);
-  BytecodeArrayBuilder& StoreGlobal(const AstRawString* name, int feedback_slot,
-                                    LanguageMode language_mode);
+  BytecodeArrayBuilder& StoreGlobal(const AstRawString* name,
+                                    int feedback_slot);
 
   // Load the object at |slot_index| at |depth| in the context chain starting
   // with |context| into the accumulator.
@@ -240,7 +240,7 @@ class V8_EXPORT_PRIVATE BytecodeArrayBuilder final {
   // Gets or creates the template for a TemplateObjectDescription which will
   // be inserted at constant pool index |template_object_description_entry|.
   BytecodeArrayBuilder& GetTemplateObject(
-      size_t template_object_description_entry);
+      size_t template_object_description_entry, int feedback_slot);
 
   // Push the context in accumulator as the new context, and store in register
   // |context|.
@@ -354,6 +354,9 @@ class V8_EXPORT_PRIVATE BytecodeArrayBuilder final {
   // the key to be deleted and the register contains a reference to the object.
   BytecodeArrayBuilder& Delete(Register object, LanguageMode language_mode);
 
+  // JavaScript defines two kinds of 'nil'.
+  enum NilValue { kNullValue, kUndefinedValue };
+
   // Tests.
   BytecodeArrayBuilder& CompareOperation(Token::Value op, Register reg,
                                          int feedback_slot);
@@ -404,7 +407,7 @@ class V8_EXPORT_PRIVATE BytecodeArrayBuilder final {
 
   BytecodeArrayBuilder& Throw();
   BytecodeArrayBuilder& ReThrow();
-  BytecodeArrayBuilder& Abort(BailoutReason reason);
+  BytecodeArrayBuilder& Abort(AbortReason reason);
   BytecodeArrayBuilder& Return();
   BytecodeArrayBuilder& ThrowReferenceErrorIfHole(const AstRawString* name);
   BytecodeArrayBuilder& ThrowSuperNotCalledIfHole();
@@ -430,9 +433,10 @@ class V8_EXPORT_PRIVATE BytecodeArrayBuilder final {
   BytecodeArrayBuilder& SuspendGenerator(Register generator,
                                          RegisterList registers,
                                          int suspend_id);
-  BytecodeArrayBuilder& RestoreGeneratorState(Register generator);
-  BytecodeArrayBuilder& RestoreGeneratorRegisters(Register generator,
-                                                  RegisterList registers);
+  BytecodeArrayBuilder& SwitchOnGeneratorState(Register generator,
+                                               BytecodeJumpTable* jump_table);
+  BytecodeArrayBuilder& ResumeGenerator(Register generator,
+                                        RegisterList registers);
 
   // Exception handling.
   BytecodeArrayBuilder& MarkHandler(int handler_id,

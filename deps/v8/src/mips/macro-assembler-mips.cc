@@ -14,6 +14,7 @@
 #include "src/debug/debug.h"
 #include "src/external-reference-table.h"
 #include "src/frames-inl.h"
+#include "src/instruction-stream.h"
 #include "src/mips/assembler-mips-inl.h"
 #include "src/mips/macro-assembler-mips.h"
 #include "src/register-configuration.h"
@@ -296,7 +297,7 @@ void MacroAssembler::RecordWrite(Register object, Register address,
     UseScratchRegisterScope temps(this);
     Register scratch = temps.Acquire();
     lw(scratch, MemOperand(address));
-    Assert(eq, kWrongAddressOrValuePassedToRecordWrite, scratch,
+    Assert(eq, AbortReason::kWrongAddressOrValuePassedToRecordWrite, scratch,
            Operand(value));
   }
 
@@ -825,7 +826,7 @@ void TurboAssembler::Ror(Register rd, Register rs, const Operand& rt) {
     if (rt.is_reg()) {
       rotrv(rd, rs, rt.rm());
     } else {
-      rotr(rd, rs, rt.immediate() & 0x1f);
+      rotr(rd, rs, rt.immediate() & 0x1F);
     }
   } else {
     if (rt.is_reg()) {
@@ -841,8 +842,8 @@ void TurboAssembler::Ror(Register rd, Register rs, const Operand& rt) {
       } else {
         UseScratchRegisterScope temps(this);
         Register scratch = temps.Acquire();
-        srl(scratch, rs, rt.immediate() & 0x1f);
-        sll(rd, rs, (0x20 - (rt.immediate() & 0x1f)) & 0x1f);
+        srl(scratch, rs, rt.immediate() & 0x1F);
+        sll(rd, rs, (0x20 - (rt.immediate() & 0x1F)) & 0x1F);
         or_(rd, rd, scratch);
       }
     }
@@ -1162,6 +1163,7 @@ void TurboAssembler::Usdc1(FPURegister fd, const MemOperand& rs,
 void TurboAssembler::Ldc1(FPURegister fd, const MemOperand& src) {
   // Workaround for non-8-byte alignment of HeapNumber, convert 64-bit
   // load to two 32-bit loads.
+  BlockTrampolinePoolScope block_trampoline_pool(this);
   DCHECK(Register::kMantissaOffset <= 4 && Register::kExponentOffset <= 4);
   MemOperand tmp = src;
   AdjustBaseAndOffset(tmp, OffsetAccessType::TWO_ACCESSES);
@@ -1185,6 +1187,7 @@ void TurboAssembler::Ldc1(FPURegister fd, const MemOperand& src) {
 void TurboAssembler::Sdc1(FPURegister fd, const MemOperand& src) {
   // Workaround for non-8-byte alignment of HeapNumber, convert 64-bit
   // store to two 32-bit stores.
+  BlockTrampolinePoolScope block_trampoline_pool(this);
   DCHECK(Register::kMantissaOffset <= 4 && Register::kExponentOffset <= 4);
   MemOperand tmp = src;
   AdjustBaseAndOffset(tmp, OffsetAccessType::TWO_ACCESSES);
@@ -2308,6 +2311,79 @@ void TurboAssembler::Clz(Register rd, Register rs) {
   }
 }
 
+void TurboAssembler::Ctz(Register rd, Register rs) {
+  if (IsMipsArchVariant(kMips32r6)) {
+    // We don't have an instruction to count the number of trailing zeroes.
+    // Start by flipping the bits end-for-end so we can count the number of
+    // leading zeroes instead.
+    Ror(rd, rs, 16);
+    wsbh(rd, rd);
+    bitswap(rd, rd);
+    Clz(rd, rd);
+  } else {
+    // Convert trailing zeroes to trailing ones, and bits to their left
+    // to zeroes.
+    UseScratchRegisterScope temps(this);
+    Register scratch = temps.Acquire();
+    Addu(scratch, rs, -1);
+    Xor(rd, scratch, rs);
+    And(rd, rd, scratch);
+    // Count number of leading zeroes.
+    Clz(rd, rd);
+    // Subtract number of leading zeroes from 32 to get number of trailing
+    // ones. Remember that the trailing ones were formerly trailing zeroes.
+    li(scratch, 32);
+    Subu(rd, scratch, rd);
+  }
+}
+
+void TurboAssembler::Popcnt(Register rd, Register rs) {
+  // https://graphics.stanford.edu/~seander/bithacks.html#CountBitsSetParallel
+  //
+  // A generalization of the best bit counting method to integers of
+  // bit-widths up to 128 (parameterized by type T) is this:
+  //
+  // v = v - ((v >> 1) & (T)~(T)0/3);                           // temp
+  // v = (v & (T)~(T)0/15*3) + ((v >> 2) & (T)~(T)0/15*3);      // temp
+  // v = (v + (v >> 4)) & (T)~(T)0/255*15;                      // temp
+  // c = (T)(v * ((T)~(T)0/255)) >> (sizeof(T) - 1) * BITS_PER_BYTE; //count
+  //
+  // For comparison, for 32-bit quantities, this algorithm can be executed
+  // using 20 MIPS instructions (the calls to LoadConst32() generate two
+  // machine instructions each for the values being used in this algorithm).
+  // A(n unrolled) loop-based algorithm requires 25 instructions.
+  //
+  // For 64-bit quantities, this algorithm gets executed twice, (once
+  // for in_lo, and again for in_hi), but saves a few instructions
+  // because the mask values only have to be loaded once. Using this
+  // algorithm the count for a 64-bit operand can be performed in 29
+  // instructions compared to a loop-based algorithm which requires 47
+  // instructions.
+  uint32_t B0 = 0x55555555;     // (T)~(T)0/3
+  uint32_t B1 = 0x33333333;     // (T)~(T)0/15*3
+  uint32_t B2 = 0x0F0F0F0F;     // (T)~(T)0/255*15
+  uint32_t value = 0x01010101;  // (T)~(T)0/255
+  uint32_t shift = 24;          // (sizeof(T) - 1) * BITS_PER_BYTE
+  UseScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
+  Register scratch2 = t8;
+  srl(scratch, rs, 1);
+  li(scratch2, B0);
+  And(scratch, scratch, scratch2);
+  Subu(scratch, rs, scratch);
+  li(scratch2, B1);
+  And(rd, scratch, scratch2);
+  srl(scratch, scratch, 2);
+  And(scratch, scratch, scratch2);
+  Addu(scratch, rd, scratch);
+  srl(rd, scratch, 4);
+  Addu(rd, rd, scratch);
+  li(scratch2, B2);
+  And(rd, rd, scratch2);
+  li(scratch, value);
+  Mul(rd, rd, scratch);
+  srl(rd, rd, shift);
+}
 
 void MacroAssembler::EmitFPUTruncate(FPURoundingMode rounding_mode,
                                      Register result,
@@ -3763,8 +3839,10 @@ void MacroAssembler::MaybeDropFrames() {
 
 void MacroAssembler::PushStackHandler() {
   // Adjust this code if not the case.
-  STATIC_ASSERT(StackHandlerConstants::kSize == 1 * kPointerSize);
+  STATIC_ASSERT(StackHandlerConstants::kSize == 2 * kPointerSize);
   STATIC_ASSERT(StackHandlerConstants::kNextOffset == 0 * kPointerSize);
+
+  Push(Smi::kZero);  // Padding.
 
   // Link the current handler as the next handler.
   li(t2,
@@ -3898,7 +3976,8 @@ void TurboAssembler::PrepareForTailCall(const ParameterCount& callee_args_count,
   }
 
   if (FLAG_debug_code) {
-    Check(lo, kStackAccessBelowStackPointer, src_reg, Operand(dst_reg));
+    Check(lo, AbortReason::kStackAccessBelowStackPointer, src_reg,
+          Operand(dst_reg));
   }
 
   // Restore caller's frame pointer and return address now as they will be
@@ -3988,12 +4067,27 @@ void MacroAssembler::InvokePrologue(const ParameterCount& expected,
 void MacroAssembler::CheckDebugHook(Register fun, Register new_target,
                                     const ParameterCount& expected,
                                     const ParameterCount& actual) {
-  Label skip_hook;
+  Label skip_hook, call_hook;
+  ExternalReference debug_is_active =
+      ExternalReference::debug_is_active_address(isolate());
+  li(t0, Operand(debug_is_active));
+  lb(t0, MemOperand(t0));
+  Branch(&skip_hook, eq, t0, Operand(zero_reg));
+
   ExternalReference debug_hook_active =
       ExternalReference::debug_hook_on_function_call_address(isolate());
   li(t0, Operand(debug_hook_active));
   lb(t0, MemOperand(t0));
+  Branch(&call_hook, ne, t0, Operand(zero_reg));
+
+  lw(t0, FieldMemOperand(fun, JSFunction::kSharedFunctionInfoOffset));
+  lw(t0, FieldMemOperand(t0, SharedFunctionInfo::kDebugInfoOffset));
+  JumpIfSmi(t0, &skip_hook);
+  lw(t0, FieldMemOperand(t0, DebugInfo::kFlagsOffset));
+  And(t0, t0, Operand(Smi::FromInt(DebugInfo::kBreakAtEntry)));
   Branch(&skip_hook, eq, t0, Operand(zero_reg));
+
+  bind(&call_hook);
   {
     FrameScope frame(this,
                      has_frame() ? StackFrame::NONE : StackFrame::INTERNAL);
@@ -4051,13 +4145,15 @@ void MacroAssembler::InvokeFunctionCode(Register function, Register new_target,
     // We call indirectly through the code field in the function to
     // allow recompilation to take effect without changing any of the
     // call sites.
-    Register code = t0;
+    Register code = kJavaScriptCallCodeStartRegister;
     lw(code, FieldMemOperand(function, JSFunction::kCodeOffset));
     if (flag == CALL_FUNCTION) {
-      Call(code, Code::kHeaderSize - kHeapObjectTag);
+      Addu(code, code, Code::kHeaderSize - kHeapObjectTag);
+      Call(code);
     } else {
       DCHECK(flag == JUMP_FUNCTION);
-      Jump(code, Code::kHeaderSize - kHeapObjectTag);
+      Addu(code, code, Code::kHeaderSize - kHeapObjectTag);
+      Jump(code);
     }
     // Continue here if InvokePrologue does handle the invocation due to
     // mismatched parameter counts.
@@ -4100,14 +4196,6 @@ void MacroAssembler::InvokeFunction(Register function,
   lw(cp, FieldMemOperand(a1, JSFunction::kContextOffset));
 
   InvokeFunctionCode(a1, no_reg, expected, actual, flag);
-}
-
-void MacroAssembler::InvokeFunction(Handle<JSFunction> function,
-                                    const ParameterCount& expected,
-                                    const ParameterCount& actual,
-                                    InvokeFlag flag) {
-  li(a1, function);
-  InvokeFunction(a1, expected, actual, flag);
 }
 
 
@@ -4464,6 +4552,12 @@ void MacroAssembler::JumpToExternalReference(const ExternalReference& builtin,
        bd);
 }
 
+void MacroAssembler::JumpToInstructionStream(const InstructionStream* stream) {
+  int32_t bytes_address = reinterpret_cast<int32_t>(stream->bytes());
+  li(kOffHeapTrampolineRegister, Operand(bytes_address, RelocInfo::NONE));
+  Jump(kOffHeapTrampolineRegister);
+}
+
 void MacroAssembler::IncrementCounter(StatsCounter* counter, int value,
                                       Register scratch1, Register scratch2) {
   DCHECK_GT(value, 0);
@@ -4491,13 +4585,13 @@ void MacroAssembler::DecrementCounter(StatsCounter* counter, int value,
 // -----------------------------------------------------------------------------
 // Debugging.
 
-void TurboAssembler::Assert(Condition cc, BailoutReason reason, Register rs,
+void TurboAssembler::Assert(Condition cc, AbortReason reason, Register rs,
                             Operand rt) {
   if (emit_debug_code())
     Check(cc, reason, rs, rt);
 }
 
-void TurboAssembler::Check(Condition cc, BailoutReason reason, Register rs,
+void TurboAssembler::Check(Condition cc, AbortReason reason, Register rs,
                            Operand rt) {
   Label L;
   Branch(&L, cc, rs, rt);
@@ -4506,11 +4600,11 @@ void TurboAssembler::Check(Condition cc, BailoutReason reason, Register rs,
   bind(&L);
 }
 
-void TurboAssembler::Abort(BailoutReason reason) {
+void TurboAssembler::Abort(AbortReason reason) {
   Label abort_start;
   bind(&abort_start);
 #ifdef DEBUG
-  const char* msg = GetBailoutReason(reason);
+  const char* msg = GetAbortReason(reason);
   if (msg != nullptr) {
     RecordComment("Abort message: ");
     RecordComment(msg);
@@ -4823,7 +4917,7 @@ void MacroAssembler::AssertNotSmi(Register object) {
     UseScratchRegisterScope temps(this);
     Register scratch = temps.Acquire();
     andi(scratch, object, kSmiTagMask);
-    Check(ne, kOperandIsASmi, scratch, Operand(zero_reg));
+    Check(ne, AbortReason::kOperandIsASmi, scratch, Operand(zero_reg));
   }
 }
 
@@ -4834,7 +4928,7 @@ void MacroAssembler::AssertSmi(Register object) {
     UseScratchRegisterScope temps(this);
     Register scratch = temps.Acquire();
     andi(scratch, object, kSmiTagMask);
-    Check(eq, kOperandIsASmi, scratch, Operand(zero_reg));
+    Check(eq, AbortReason::kOperandIsASmi, scratch, Operand(zero_reg));
   }
 }
 
@@ -4842,9 +4936,11 @@ void MacroAssembler::AssertFixedArray(Register object) {
   if (emit_debug_code()) {
     STATIC_ASSERT(kSmiTag == 0);
     SmiTst(object, t8);
-    Check(ne, kOperandIsASmiAndNotAFixedArray, t8, Operand(zero_reg));
+    Check(ne, AbortReason::kOperandIsASmiAndNotAFixedArray, t8,
+          Operand(zero_reg));
     GetObjectType(object, t8, t8);
-    Check(eq, kOperandIsNotAFixedArray, t8, Operand(FIXED_ARRAY_TYPE));
+    Check(eq, AbortReason::kOperandIsNotAFixedArray, t8,
+          Operand(FIXED_ARRAY_TYPE));
   }
 }
 
@@ -4852,9 +4948,11 @@ void MacroAssembler::AssertFunction(Register object) {
   if (emit_debug_code()) {
     STATIC_ASSERT(kSmiTag == 0);
     SmiTst(object, t8);
-    Check(ne, kOperandIsASmiAndNotAFunction, t8, Operand(zero_reg));
+    Check(ne, AbortReason::kOperandIsASmiAndNotAFunction, t8,
+          Operand(zero_reg));
     GetObjectType(object, t8, t8);
-    Check(eq, kOperandIsNotAFunction, t8, Operand(JS_FUNCTION_TYPE));
+    Check(eq, AbortReason::kOperandIsNotAFunction, t8,
+          Operand(JS_FUNCTION_TYPE));
   }
 }
 
@@ -4863,9 +4961,11 @@ void MacroAssembler::AssertBoundFunction(Register object) {
   if (emit_debug_code()) {
     STATIC_ASSERT(kSmiTag == 0);
     SmiTst(object, t8);
-    Check(ne, kOperandIsASmiAndNotABoundFunction, t8, Operand(zero_reg));
+    Check(ne, AbortReason::kOperandIsASmiAndNotABoundFunction, t8,
+          Operand(zero_reg));
     GetObjectType(object, t8, t8);
-    Check(eq, kOperandIsNotABoundFunction, t8, Operand(JS_BOUND_FUNCTION_TYPE));
+    Check(eq, AbortReason::kOperandIsNotABoundFunction, t8,
+          Operand(JS_BOUND_FUNCTION_TYPE));
   }
 }
 
@@ -4873,7 +4973,8 @@ void MacroAssembler::AssertGeneratorObject(Register object) {
   if (!emit_debug_code()) return;
   STATIC_ASSERT(kSmiTag == 0);
   SmiTst(object, t8);
-  Check(ne, kOperandIsASmiAndNotAGeneratorObject, t8, Operand(zero_reg));
+  Check(ne, AbortReason::kOperandIsASmiAndNotAGeneratorObject, t8,
+        Operand(zero_reg));
 
   GetObjectType(object, t8, t8);
 
@@ -4885,7 +4986,7 @@ void MacroAssembler::AssertGeneratorObject(Register object) {
   // Check if JSAsyncGeneratorObject
   Branch(&done, eq, t8, Operand(JS_ASYNC_GENERATOR_OBJECT_TYPE));
 
-  Abort(kOperandIsNotAGeneratorObject);
+  Abort(AbortReason::kOperandIsNotAGeneratorObject);
 
   bind(&done);
 }
@@ -4899,7 +5000,7 @@ void MacroAssembler::AssertUndefinedOrAllocationSite(Register object,
     Branch(&done_checking, eq, object, Operand(scratch));
     lw(t8, FieldMemOperand(object, HeapObject::kMapOffset));
     LoadRoot(scratch, Heap::kAllocationSiteMapRootIndex);
-    Assert(eq, kExpectedUndefinedOrCell, t8, Operand(scratch));
+    Assert(eq, AbortReason::kExpectedUndefinedOrCell, t8, Operand(scratch));
     bind(&done_checking);
   }
 }
@@ -5127,20 +5228,11 @@ void TurboAssembler::PrepareCallCFunction(int num_reg_arguments,
 void TurboAssembler::CallCFunction(ExternalReference function,
                                    int num_reg_arguments,
                                    int num_double_arguments) {
-  if (IsMipsArchVariant(kMips32r6)) {
-    uint32_t lui_offset, jialc_offset;
-    UnpackTargetAddressUnsigned(Operand(function).immediate(), lui_offset,
-                                jialc_offset);
-    if (MustUseReg(Operand(function).rmode())) {
-      RecordRelocInfo(Operand(function).rmode(), Operand(function).immediate());
-    }
-    lui(t9, lui_offset);
-    CallCFunctionHelper(t9, jialc_offset, num_reg_arguments,
-                        num_double_arguments);
-  } else {
-    li(t9, Operand(function));
-    CallCFunctionHelper(t9, 0, num_reg_arguments, num_double_arguments);
-  }
+  // Linux/MIPS convention demands that register t9 contains
+  // the address of the function being call in case of
+  // Position independent code
+  li(t9, Operand(function));
+  CallCFunctionHelper(t9, 0, num_reg_arguments, num_double_arguments);
 }
 
 void TurboAssembler::CallCFunction(Register function, int num_reg_arguments,
@@ -5195,6 +5287,11 @@ void TurboAssembler::CallCFunctionHelper(Register function_base,
   if (function_base != t9) {
     mov(t9, function_base);
     function_base = t9;
+  }
+
+  if (function_offset != 0) {
+    addiu(t9, t9, function_offset);
+    function_offset = 0;
   }
 
   Call(function_base, function_offset);
@@ -5267,6 +5364,26 @@ bool AreAliased(Register reg1, Register reg2, Register reg3, Register reg4,
 
   return n_of_valid_regs != n_of_non_aliasing_regs;
 }
+
+void TurboAssembler::ComputeCodeStartAddress(Register dst) {
+  // This push on ra and the pop below together ensure that we restore the
+  // register ra, which is needed while computing the code start address.
+  push(ra);
+
+  // The bal instruction puts the address of the current instruction into
+  // the return address (ra) register, which we can use later on.
+  Label current;
+  bal(&current);
+  nop();
+  int pc = pc_offset();
+  bind(&current);
+  li(dst, pc);
+  subu(dst, ra, dst);
+
+  pop(ra);  // Restore ra
+}
+
+void TurboAssembler::ResetSpeculationPoisonRegister() { UNREACHABLE(); }
 
 }  // namespace internal
 }  // namespace v8

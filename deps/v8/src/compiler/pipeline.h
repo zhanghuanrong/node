@@ -46,7 +46,7 @@ class Pipeline : public AllStatic {
   // Returns a new compilation job for the WebAssembly compilation info.
   static CompilationJob* NewWasmCompilationJob(
       CompilationInfo* info, Isolate* isolate, JSGraph* jsgraph,
-      CallDescriptor* descriptor, SourcePositionTable* source_positions,
+      CallDescriptor* call_descriptor, SourcePositionTable* source_positions,
       std::vector<trap_handler::ProtectedInstructionData>*
           protected_instructions,
       wasm::ModuleOrigin wasm_origin);
@@ -76,7 +76,7 @@ class Pipeline : public AllStatic {
 
   // Run the pipeline on a machine graph and generate code. If {schedule} is
   // {nullptr}, then compute a new schedule for code generation.
-  static Handle<Code> GenerateCodeForTesting(
+  V8_EXPORT_PRIVATE static Handle<Code> GenerateCodeForTesting(
       CompilationInfo* info, Isolate* isolate, CallDescriptor* call_descriptor,
       Graph* graph, Schedule* schedule = nullptr,
       SourcePositionTable* source_positions = nullptr);

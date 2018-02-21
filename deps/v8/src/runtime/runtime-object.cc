@@ -439,6 +439,61 @@ RUNTIME_FUNCTION(Runtime_OptimizeObjectForAddingMultipleProperties) {
   return *object;
 }
 
+RUNTIME_FUNCTION(Runtime_ObjectValues) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(1, args.length());
+
+  CONVERT_ARG_HANDLE_CHECKED(JSReceiver, receiver, 0);
+
+  Handle<FixedArray> values;
+  ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
+      isolate, values,
+      JSReceiver::GetOwnValues(receiver, PropertyFilter::ENUMERABLE_STRINGS,
+                               true));
+  return *isolate->factory()->NewJSArrayWithElements(values);
+}
+
+RUNTIME_FUNCTION(Runtime_ObjectValuesSkipFastPath) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(1, args.length());
+
+  CONVERT_ARG_HANDLE_CHECKED(JSReceiver, receiver, 0);
+
+  Handle<FixedArray> value;
+  ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
+      isolate, value,
+      JSReceiver::GetOwnValues(receiver, PropertyFilter::ENUMERABLE_STRINGS,
+                               false));
+  return *isolate->factory()->NewJSArrayWithElements(value);
+}
+
+RUNTIME_FUNCTION(Runtime_ObjectEntries) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(1, args.length());
+
+  CONVERT_ARG_HANDLE_CHECKED(JSReceiver, receiver, 0);
+
+  Handle<FixedArray> entries;
+  ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
+      isolate, entries,
+      JSReceiver::GetOwnEntries(receiver, PropertyFilter::ENUMERABLE_STRINGS,
+                                true));
+  return *isolate->factory()->NewJSArrayWithElements(entries);
+}
+
+RUNTIME_FUNCTION(Runtime_ObjectEntriesSkipFastPath) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(1, args.length());
+
+  CONVERT_ARG_HANDLE_CHECKED(JSReceiver, receiver, 0);
+
+  Handle<FixedArray> entries;
+  ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
+      isolate, entries,
+      JSReceiver::GetOwnEntries(receiver, PropertyFilter::ENUMERABLE_STRINGS,
+                                false));
+  return *isolate->factory()->NewJSArrayWithElements(entries);
+}
 
 RUNTIME_FUNCTION(Runtime_GetProperty) {
   HandleScope scope(isolate);
@@ -770,10 +825,11 @@ RUNTIME_FUNCTION(Runtime_DefineDataPropertyInLiteral) {
   CONVERT_ARG_HANDLE_CHECKED(FeedbackVector, vector, 4);
   CONVERT_SMI_ARG_CHECKED(index, 5);
 
-  StoreDataPropertyInLiteralICNexus nexus(vector, vector->ToSlot(index));
+  FeedbackNexus nexus(vector, FeedbackVector::ToSlot(index));
   if (nexus.ic_state() == UNINITIALIZED) {
     if (name->IsUniqueName()) {
-      nexus.ConfigureMonomorphic(name, handle(object->map()));
+      nexus.ConfigureMonomorphic(name, handle(object->map()),
+                                 Handle<Code>::null());
     } else {
       nexus.ConfigureMegamorphic(PROPERTY);
     }
@@ -833,7 +889,7 @@ RUNTIME_FUNCTION(Runtime_CollectTypeProfile) {
   }
 
   DCHECK(vector->metadata()->HasTypeProfileSlot());
-  CollectTypeProfileNexus nexus(vector, vector->GetTypeProfileSlot());
+  FeedbackNexus nexus(vector, vector->GetTypeProfileSlot());
   nexus.Collect(type, position->value());
 
   return isolate->heap()->undefined_value();
@@ -1175,7 +1231,7 @@ RUNTIME_FUNCTION(Runtime_CreateDataProperty) {
 RUNTIME_FUNCTION(Runtime_IterableToListCanBeElided) {
   HandleScope scope(isolate);
   DCHECK_EQ(1, args.length());
-  CONVERT_ARG_HANDLE_CHECKED(JSReceiver, obj, 0);
+  CONVERT_ARG_HANDLE_CHECKED(HeapObject, obj, 0);
 
   if (!obj->IsJSObject()) return isolate->heap()->ToBoolean(false);
 

@@ -674,8 +674,15 @@ void OS::StrNCpy(char* dest, int length, const char* src, size_t n) {
 #undef _TRUNCATE
 #undef STRUNCATE
 
-// The allocation alignment is the guaranteed alignment for
-// VirtualAlloc'ed blocks of memory.
+static LazyInstance<RandomNumberGenerator>::type
+    platform_random_number_generator = LAZY_INSTANCE_INITIALIZER;
+static LazyMutex rng_mutex = LAZY_MUTEX_INITIALIZER;
+
+void OS::Initialize(bool hard_abort, const char* const gc_fake_mmap) {
+  g_hard_abort = hard_abort;
+}
+
+// static
 size_t OS::AllocatePageSize() {
   static size_t allocate_alignment = 0;
   if (allocate_alignment == 0) {
@@ -686,6 +693,7 @@ size_t OS::AllocatePageSize() {
   return allocate_alignment;
 }
 
+// static
 size_t OS::CommitPageSize() {
   static size_t page_size = 0;
   if (page_size == 0) {
@@ -697,17 +705,15 @@ size_t OS::CommitPageSize() {
   return page_size;
 }
 
-static LazyInstance<RandomNumberGenerator>::type
-    platform_random_number_generator = LAZY_INSTANCE_INITIALIZER;
-
-void OS::Initialize(int64_t random_seed, bool hard_abort,
-                    const char* const gc_fake_mmap) {
-  if (random_seed) {
-    platform_random_number_generator.Pointer()->SetSeed(random_seed);
+// static
+void OS::SetRandomMmapSeed(int64_t seed) {
+  if (seed) {
+    LockGuard<Mutex> guard(rng_mutex.Pointer());
+    platform_random_number_generator.Pointer()->SetSeed(seed);
   }
-  g_hard_abort = hard_abort;
 }
 
+// static
 void* OS::GetRandomMmapAddr() {
 // The address range used to randomize RWX allocations in OS::Allocate
 // Try not to map pages into the default range that windows loads DLLs
@@ -722,8 +728,11 @@ void* OS::GetRandomMmapAddr() {
   static const uintptr_t kAllocationRandomAddressMax = 0x3FFF0000;
 #endif
   uintptr_t address;
-  platform_random_number_generator.Pointer()->NextBytes(&address,
-                                                        sizeof(address));
+  {
+    LockGuard<Mutex> guard(rng_mutex.Pointer());
+    platform_random_number_generator.Pointer()->NextBytes(&address,
+                                                          sizeof(address));
+  }
   address <<= kPageSizeBits;
   address += kAllocationRandomAddressMin;
   address &= kAllocationRandomAddressMax;
@@ -820,15 +829,14 @@ void* OS::Allocate(void* address, size_t size, size_t alignment,
     // base will be nullptr.
     if (base != nullptr) break;
   }
-  DCHECK_EQ(base, aligned_base);
+  DCHECK_IMPLIES(base, base == aligned_base);
   return reinterpret_cast<void*>(base);
 }
 
 // static
 bool OS::Free(void* address, const size_t size) {
   DCHECK_EQ(0, reinterpret_cast<uintptr_t>(address) % AllocatePageSize());
-  // TODO(bbudge) Add DCHECK_EQ(0, size % AllocatePageSize()) when callers
-  // pass the correct size on Windows.
+  DCHECK_EQ(0, size % AllocatePageSize());
   USE(size);
   return VirtualFree(address, 0, MEM_RELEASE) != 0;
 }

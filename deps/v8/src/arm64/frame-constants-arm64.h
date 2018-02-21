@@ -2,16 +2,37 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#ifndef V8_ARM64_FRAMES_ARM64_H_
-#define V8_ARM64_FRAMES_ARM64_H_
+#ifndef V8_ARM64_FRAME_CONSTANTS_ARM64_H_
+#define V8_ARM64_FRAME_CONSTANTS_ARM64_H_
 
 namespace v8 {
 namespace internal {
 
+// The layout of an EntryFrame is as follows:
+//
+//  slot      Entry frame
+//       +---------------------+-----------------------
+//   0   |  bad frame pointer  |  <-- frame ptr
+//       |   (0xFFF.. FF)      |
+//       |- - - - - - - - - - -|
+//   1   | stack frame marker  |
+//       |      (ENTRY)        |
+//       |- - - - - - - - - - -|
+//   2   | stack frame marker  |
+//       |        (0)          |
+//       |- - - - - - - - - - -|
+//   3   |     C entry FP      |
+//       |- - - - - - - - - - -|
+//   4   |   JS entry frame    |
+//       |       marker        |
+//       |- - - - - - - - - - -|
+//   5   |      padding        |  <-- stack ptr
+//  -----+---------------------+-----------------------
+//
 class EntryFrameConstants : public AllStatic {
  public:
-  static const int kCallerFPOffset =
-      -(StandardFrameConstants::kFixedFrameSizeFromFp + kPointerSize);
+  static const int kCallerFPOffset = -3 * kPointerSize;
+  static const int kFixedFrameSize = 6 * kPointerSize;
 };
 
 class ExitFrameConstants : public TypedFrameConstants {
@@ -40,4 +61,4 @@ class JavaScriptFrameConstants : public AllStatic {
 }  // namespace internal
 }  // namespace v8
 
-#endif  // V8_ARM64_FRAMES_ARM64_H_
+#endif  // V8_ARM64_FRAME_CONSTANTS_ARM64_H_

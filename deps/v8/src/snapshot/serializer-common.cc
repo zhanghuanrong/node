@@ -55,6 +55,17 @@ ExternalReferenceEncoder::~ExternalReferenceEncoder() {
 #endif  // DEBUG
 }
 
+Maybe<ExternalReferenceEncoder::Value> ExternalReferenceEncoder::TryEncode(
+    Address address) {
+  Maybe<uint32_t> maybe_index = map_->Get(address);
+  if (maybe_index.IsNothing()) return Nothing<Value>();
+  Value result(maybe_index.FromJust());
+#ifdef DEBUG
+  if (result.is_from_api()) count_[result.index()]++;
+#endif  // DEBUG
+  return Just<Value>(result);
+}
+
 ExternalReferenceEncoder::Value ExternalReferenceEncoder::Encode(
     Address address) {
   Maybe<uint32_t> maybe_index = map_->Get(address);
@@ -100,7 +111,8 @@ void SerializerDeserializer::Iterate(Isolate* isolate, RootVisitor* visitor) {
     if (cache->size() <= i) cache->push_back(Smi::kZero);
     // During deserialization, the visitor populates the partial snapshot cache
     // and eventually terminates the cache with undefined.
-    visitor->VisitRootPointer(Root::kPartialSnapshotCache, &cache->at(i));
+    visitor->VisitRootPointer(Root::kPartialSnapshotCache, nullptr,
+                              &cache->at(i));
     if (cache->at(i)->IsUndefined(isolate)) break;
   }
 }

@@ -66,30 +66,17 @@ SamplingHeapProfiler::SamplingHeapProfiler(
       rate_(rate),
       flags_(flags) {
   CHECK_GT(rate_, 0u);
-  heap->new_space()->AddAllocationObserver(new_space_observer_.get());
-  AllSpaces spaces(heap);
-  for (Space* space = spaces.next(); space != nullptr; space = spaces.next()) {
-    if (space != heap->new_space()) {
-      space->AddAllocationObserver(other_spaces_observer_.get());
-    }
-  }
+
+  heap_->AddAllocationObserversToAllSpaces(other_spaces_observer_.get(),
+                                           new_space_observer_.get());
 }
 
 
 SamplingHeapProfiler::~SamplingHeapProfiler() {
-  heap_->new_space()->RemoveAllocationObserver(new_space_observer_.get());
-  AllSpaces spaces(heap_);
-  for (Space* space = spaces.next(); space != nullptr; space = spaces.next()) {
-    if (space != heap_->new_space()) {
-      space->RemoveAllocationObserver(other_spaces_observer_.get());
-    }
-  }
+  heap_->RemoveAllocationObserversFromAllSpaces(other_spaces_observer_.get(),
+                                                new_space_observer_.get());
 
-  for (auto sample : samples_) {
-    delete sample;
-  }
-  std::set<Sample*> empty;
-  samples_.swap(empty);
+  samples_.clear();
 }
 
 
@@ -110,7 +97,7 @@ void SamplingHeapProfiler::SampleObject(Address soon_object, size_t size) {
   AllocationNode* node = AddStack();
   node->allocations_[size]++;
   Sample* sample = new Sample(size, node, loc, this);
-  samples_.insert(sample);
+  samples_.emplace(sample);
   sample->global.SetWeak(sample, OnWeakCallback, WeakCallbackType::kParameter);
 }
 
@@ -132,8 +119,14 @@ void SamplingHeapProfiler::OnWeakCallback(
       node = parent;
     }
   }
-  sample->profiler->samples_.erase(sample);
-  delete sample;
+  auto it = std::find_if(sample->profiler->samples_.begin(),
+                         sample->profiler->samples_.end(),
+                         [&sample](const std::unique_ptr<Sample>& s) {
+                           return s.get() == sample;
+                         });
+
+  sample->profiler->samples_.erase(it);
+  // sample is deleted because its unique ptr was erased from samples_.
 }
 
 SamplingHeapProfiler::AllocationNode*

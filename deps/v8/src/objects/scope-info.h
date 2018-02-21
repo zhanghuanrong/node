@@ -7,6 +7,7 @@
 
 #include "src/globals.h"
 #include "src/objects.h"
+#include "src/objects/fixed-array.h"
 #include "src/utils.h"
 
 // Has to be the last include (doesn't have include guards):
@@ -34,6 +35,7 @@ class Zone;
 class ScopeInfo : public FixedArray {
  public:
   DECL_CAST(ScopeInfo)
+  DECL_PRINTER(ScopeInfo)
 
   // Return the type of this scope.
   ScopeType scope_type();
@@ -186,10 +188,6 @@ class ScopeInfo : public FixedArray {
   // Serializes empty scope info.
   V8_EXPORT_PRIVATE static ScopeInfo* Empty(Isolate* isolate);
 
-#ifdef DEBUG
-  void Print();
-#endif
-
 // The layout of the static part of a ScopeInfo is as follows. Each entry is
 // numeric and occupies one array slot.
 // 1. A set of properties of the scope.
@@ -306,11 +304,13 @@ class ScopeInfo : public FixedArray {
   class HasSimpleParametersField
       : public BitField<bool, AsmModuleField::kNext, 1> {};
   class FunctionKindField
-      : public BitField<FunctionKind, HasSimpleParametersField::kNext, 10> {};
+      : public BitField<FunctionKind, HasSimpleParametersField::kNext, 11> {};
   class HasOuterScopeInfoField
       : public BitField<bool, FunctionKindField::kNext, 1> {};
   class IsDebugEvaluateScopeField
       : public BitField<bool, HasOuterScopeInfoField::kNext, 1> {};
+
+  STATIC_ASSERT(kLastFunctionKind <= FunctionKindField::kMax);
 
   // Properties of variables.
   class VariableModeField : public BitField<VariableMode, 0, 3> {};

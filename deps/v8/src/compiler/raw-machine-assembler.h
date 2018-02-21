@@ -186,6 +186,10 @@ class V8_EXPORT_PRIVATE RawMachineAssembler {
                    old_value, new_value);
   }
 
+  Node* SpeculationFence() {
+    return AddNode(machine()->SpeculationFence().op());
+  }
+
   // Arithmetic Operations.
   Node* WordAnd(Node* a, Node* b) {
     return AddNode(machine()->WordAnd(), a, b);
@@ -740,19 +744,24 @@ class V8_EXPORT_PRIVATE RawMachineAssembler {
   Node* StringConstant(const char* string) {
     return HeapConstant(isolate()->factory()->InternalizeUtf8String(string));
   }
+  Node* SpeculationPoison() {
+    return AddNode(machine()->SpeculationPoison(), graph()->start());
+  }
 
   // Call a given call descriptor and the given arguments.
   // The call target is passed as part of the {inputs} array.
-  Node* CallN(CallDescriptor* desc, int input_count, Node* const* inputs);
+  Node* CallN(CallDescriptor* call_descriptor, int input_count,
+              Node* const* inputs);
 
   // Call a given call descriptor and the given arguments and frame-state.
   // The call target and frame state are passed as part of the {inputs} array.
-  Node* CallNWithFrameState(CallDescriptor* desc, int input_count,
+  Node* CallNWithFrameState(CallDescriptor* call_descriptor, int input_count,
                             Node* const* inputs);
 
   // Tail call a given call descriptor and the given arguments.
   // The call target is passed as part of the {inputs} array.
-  Node* TailCallN(CallDescriptor* desc, int input_count, Node* const* inputs);
+  Node* TailCallN(CallDescriptor* call_descriptor, int input_count,
+                  Node* const* inputs);
 
   // Call to a C function with zero arguments.
   Node* CallCFunction0(MachineType return_type, Node* function);
@@ -828,9 +837,12 @@ class V8_EXPORT_PRIVATE RawMachineAssembler {
   void Return(Node* value);
   void Return(Node* v1, Node* v2);
   void Return(Node* v1, Node* v2, Node* v3);
+  void Return(Node* v1, Node* v2, Node* v3, Node* v4);
+  void Return(int count, Node* v[]);
   void PopAndReturn(Node* pop, Node* value);
   void PopAndReturn(Node* pop, Node* v1, Node* v2);
   void PopAndReturn(Node* pop, Node* v1, Node* v2, Node* v3);
+  void PopAndReturn(Node* pop, Node* v1, Node* v2, Node* v3, Node* v4);
   void Bind(RawMachineLabel* label);
   void Deoptimize(Node* state);
   void DebugAbort(Node* message);
@@ -896,6 +908,7 @@ class V8_EXPORT_PRIVATE RawMachineAssembler {
   CommonOperatorBuilder common_;
   CallDescriptor* call_descriptor_;
   NodeVector parameters_;
+  Node* speculation_poison_;
   BasicBlock* current_block_;
 
   DISALLOW_COPY_AND_ASSIGN(RawMachineAssembler);

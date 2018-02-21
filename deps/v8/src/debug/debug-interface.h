@@ -5,7 +5,6 @@
 #ifndef V8_DEBUG_DEBUG_INTERFACE_H_
 #define V8_DEBUG_DEBUG_INTERFACE_H_
 
-#include "include/v8-debug.h"
 #include "include/v8-util.h"
 #include "include/v8.h"
 
@@ -499,6 +498,9 @@ int GetNativeAccessorDescriptor(v8::Local<v8::Context> context,
                                 v8::Local<v8::Name> name);
 
 int64_t GetNextRandomInt64(v8::Isolate* isolate);
+
+v8::MaybeLocal<v8::Value> EvaluateGlobal(v8::Isolate* isolate,
+                                         v8::Local<v8::String> source);
 
 }  // namespace debug
 }  // namespace v8

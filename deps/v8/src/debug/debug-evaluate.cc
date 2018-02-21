@@ -16,33 +16,30 @@
 #include "src/interpreter/bytecode-array-iterator.h"
 #include "src/interpreter/bytecodes.h"
 #include "src/isolate-inl.h"
+#include "src/snapshot/snapshot.h"
 
 namespace v8 {
 namespace internal {
 
-static inline bool IsDebugContext(Isolate* isolate, Context* context) {
-  return context->native_context() == *isolate->debug()->debug_context();
-}
-
 MaybeHandle<Object> DebugEvaluate::Global(Isolate* isolate,
                                           Handle<String> source) {
-  // Handle the processing of break.
-  DisableBreak disable_break_scope(isolate->debug());
-
-  // Enter the top context from before the debugger was invoked.
-  SaveContext save(isolate);
-  SaveContext* top = &save;
-  while (top != nullptr && IsDebugContext(isolate, *top->context())) {
-    top = top->prev();
-  }
-  if (top != nullptr) isolate->set_context(*top->context());
-
-  // Get the native context now set to the top context from before the
-  // debugger was invoked.
   Handle<Context> context = isolate->native_context();
-  Handle<JSObject> receiver(context->global_proxy());
-  Handle<SharedFunctionInfo> outer_info(context->closure()->shared(), isolate);
-  return Evaluate(isolate, outer_info, context, receiver, source, false);
+  ScriptOriginOptions origin_options(false, true);
+  MaybeHandle<SharedFunctionInfo> maybe_function_info =
+      Compiler::GetSharedFunctionInfoForScript(
+          source, isolate->factory()->empty_string(), 0, 0, origin_options,
+          MaybeHandle<Object>(), context, nullptr, nullptr,
+          ScriptCompiler::kNoCompileOptions, ScriptCompiler::kNoCacheNoReason,
+          NOT_NATIVES_CODE, MaybeHandle<FixedArray>());
+
+  Handle<SharedFunctionInfo> shared_info;
+  if (!maybe_function_info.ToHandle(&shared_info)) return MaybeHandle<Object>();
+
+  Handle<JSFunction> fun =
+      isolate->factory()->NewFunctionFromSharedFunctionInfo(shared_info,
+                                                            context);
+  return Execution::Call(isolate, fun,
+                         Handle<JSObject>(context->global_proxy()), 0, nullptr);
 }
 
 MaybeHandle<Object> DebugEvaluate::Local(Isolate* isolate,
@@ -57,13 +54,6 @@ MaybeHandle<Object> DebugEvaluate::Local(Isolate* isolate,
   StackTraceFrameIterator it(isolate, frame_id);
   if (!it.is_javascript()) return isolate->factory()->undefined_value();
   JavaScriptFrame* frame = it.javascript_frame();
-
-  // Traverse the saved contexts chain to find the active context for the
-  // selected frame.
-  SaveContext* save =
-      DebugFrameHelper::FindSavedContextForFrame(isolate, frame);
-  SaveContext savex(isolate);
-  isolate->set_context(*(save->context()));
 
   // This is not a lot different than DebugEvaluate::Global, except that
   // variables accessible by the function we are evaluating from are
@@ -284,7 +274,7 @@ bool IntrinsicHasNoSideEffect(Runtime::FunctionId id) {
   V(ToString)                            \
   V(ToLength)                            \
   V(ToNumber)                            \
-  V(NumberToString)                      \
+  V(NumberToStringSkipCache)             \
   /* Type checks */                      \
   V(IsJSReceiver)                        \
   V(IsSmi)                               \
@@ -298,7 +288,6 @@ bool IntrinsicHasNoSideEffect(Runtime::FunctionId id) {
   V(IsJSWeakSet)                         \
   V(IsRegExp)                            \
   V(IsTypedArray)                        \
-  V(ClassOf)                             \
   /* Loads */                            \
   V(LoadLookupSlotForCall)               \
   /* Arrays */                           \
@@ -334,6 +323,7 @@ bool IntrinsicHasNoSideEffect(Runtime::FunctionId id) {
   /* Collections */                      \
   V(GenericHash)                         \
   /* Called from builtins */             \
+  V(ClassOf)                             \
   V(StringAdd)                           \
   V(StringParseFloat)                    \
   V(StringParseInt)                      \
@@ -349,25 +339,31 @@ bool IntrinsicHasNoSideEffect(Runtime::FunctionId id) {
   V(AllocateSeqOneByteString)            \
   V(AllocateSeqTwoByteString)            \
   V(ObjectCreate)                        \
+  V(ObjectEntries)                       \
+  V(ObjectEntriesSkipFastPath)           \
   V(ObjectHasOwnProperty)                \
+  V(ObjectValues)                        \
+  V(ObjectValuesSkipFastPath)            \
   V(ArrayIndexOf)                        \
   V(ArrayIncludes_Slow)                  \
   V(ArrayIsArray)                        \
   V(ThrowTypeError)                      \
-  V(ThrowCalledOnNullOrUndefined)        \
-  V(ThrowIncompatibleMethodReceiver)     \
-  V(ThrowInvalidHint)                    \
-  V(ThrowNotDateError)                   \
   V(ThrowRangeError)                     \
   V(ToName)                              \
   V(GetOwnPropertyDescriptor)            \
+  V(StackGuard)                          \
   /* Misc. */                            \
   V(Call)                                \
   V(MaxSmi)                              \
   V(NewObject)                           \
   V(CompleteInobjectSlackTrackingForMap) \
   V(HasInPrototypeChain)                 \
-  V(StringMaxLength)
+  V(StringMaxLength)                     \
+  /* Test */                             \
+  V(OptimizeOsr)                         \
+  V(OptimizeFunctionOnNextCall)          \
+  V(UnblockConcurrentRecompilation)      \
+  V(GetOptimizationStatus)
 
 #define CASE(Name)       \
   case Runtime::k##Name: \
@@ -522,6 +518,8 @@ bool BuiltinHasNoSideEffect(Builtins::Name id) {
     case Builtins::kArrayPrototypeValues:
     case Builtins::kArrayIncludes:
     case Builtins::kArrayPrototypeEntries:
+    case Builtins::kArrayPrototypeFind:
+    case Builtins::kArrayPrototypeFindIndex:
     case Builtins::kArrayPrototypeKeys:
     case Builtins::kArrayForEach:
     case Builtins::kArrayEvery:
@@ -662,8 +660,8 @@ bool BuiltinHasNoSideEffect(Builtins::Name id) {
     case Builtins::kStringPrototypeToUpperCase:
 #endif
     case Builtins::kStringPrototypeTrim:
-    case Builtins::kStringPrototypeTrimLeft:
-    case Builtins::kStringPrototypeTrimRight:
+    case Builtins::kStringPrototypeTrimEnd:
+    case Builtins::kStringPrototypeTrimStart:
     case Builtins::kStringPrototypeValueOf:
     case Builtins::kStringToNumber:
     case Builtins::kSubString:
@@ -751,16 +749,24 @@ bool DebugEvaluate::FunctionHasNoSideEffect(Handle<SharedFunctionInfo> info) {
                             ? info->lazy_deserialization_builtin_id()
                             : info->code()->builtin_index();
     DCHECK_NE(Builtins::kDeserializeLazy, builtin_index);
-    if (builtin_index >= 0 && builtin_index < Builtins::builtin_count &&
+    if (Builtins::IsBuiltinId(builtin_index) &&
         BuiltinHasNoSideEffect(static_cast<Builtins::Name>(builtin_index))) {
 #ifdef DEBUG
-      if (info->code()->builtin_index() == Builtins::kDeserializeLazy) {
-        return true;  // Target builtin is not yet deserialized.
+      Isolate* isolate = info->GetIsolate();
+      Code* code = isolate->builtins()->builtin(builtin_index);
+      if (code->builtin_index() == Builtins::kDeserializeLazy) {
+        // Target builtin is not yet deserialized. Deserialize it now.
+
+        DCHECK(Builtins::IsLazy(builtin_index));
+        DCHECK_EQ(Builtins::TFJ, Builtins::KindOf(builtin_index));
+
+        code = Snapshot::DeserializeBuiltin(isolate, builtin_index);
+        DCHECK_NE(Builtins::kDeserializeLazy, code->builtin_index());
       }
       // TODO(yangguo): Check builtin-to-builtin calls too.
       int mode = RelocInfo::ModeMask(RelocInfo::EXTERNAL_REFERENCE);
       bool failed = false;
-      for (RelocIterator it(info->code(), mode); !it.done(); it.next()) {
+      for (RelocIterator it(code, mode); !it.done(); it.next()) {
         RelocInfo* rinfo = it.rinfo();
         Address address = rinfo->target_external_reference();
         const Runtime::Function* function = Runtime::FunctionForEntry(address);

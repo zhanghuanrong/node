@@ -491,6 +491,9 @@ class LocationOperand : public InstructionOperand {
     UNREACHABLE();
   }
 
+  // Return true if the locations can be moved to one another.
+  bool IsCompatible(LocationOperand* op);
+
   static LocationOperand* cast(InstructionOperand* op) {
     DCHECK(op->IsAnyLocationOperand());
     return static_cast<LocationOperand*>(op);
@@ -889,7 +892,8 @@ class V8_EXPORT_PRIVATE Instruction final {
 
   bool IsDeoptimizeCall() const {
     return arch_opcode() == ArchOpcode::kArchDeoptimize ||
-           FlagsModeField::decode(opcode()) == kFlags_deoptimize;
+           FlagsModeField::decode(opcode()) == kFlags_deoptimize ||
+           FlagsModeField::decode(opcode()) == kFlags_deoptimize_and_poison;
   }
 
   bool IsTrap() const {
@@ -1093,11 +1097,7 @@ class V8_EXPORT_PRIVATE Constant final {
 
  private:
   Type type_;
-#if V8_TARGET_ARCH_32_BIT
-  RelocInfo::Mode rmode_ = RelocInfo::NONE32;
-#else
-  RelocInfo::Mode rmode_ = RelocInfo::NONE64;
-#endif
+  RelocInfo::Mode rmode_ = RelocInfo::NONE;
   int64_t value_;
 };
 
@@ -1317,17 +1317,22 @@ class DeoptimizationEntry final {
  public:
   DeoptimizationEntry() {}
   DeoptimizationEntry(FrameStateDescriptor* descriptor, DeoptimizeKind kind,
-                      DeoptimizeReason reason)
-      : descriptor_(descriptor), kind_(kind), reason_(reason) {}
+                      DeoptimizeReason reason, VectorSlotPair const& feedback)
+      : descriptor_(descriptor),
+        kind_(kind),
+        reason_(reason),
+        feedback_(feedback) {}
 
   FrameStateDescriptor* descriptor() const { return descriptor_; }
   DeoptimizeKind kind() const { return kind_; }
   DeoptimizeReason reason() const { return reason_; }
+  VectorSlotPair const& feedback() const { return feedback_; }
 
  private:
   FrameStateDescriptor* descriptor_ = nullptr;
   DeoptimizeKind kind_ = DeoptimizeKind::kEager;
-  DeoptimizeReason reason_ = DeoptimizeReason::kNoReason;
+  DeoptimizeReason reason_ = DeoptimizeReason::kUnknown;
+  VectorSlotPair feedback_ = VectorSlotPair();
 };
 
 typedef ZoneVector<DeoptimizationEntry> DeoptimizationVector;
@@ -1586,7 +1591,8 @@ class V8_EXPORT_PRIVATE InstructionSequence final
   }
 
   int AddDeoptimizationEntry(FrameStateDescriptor* descriptor,
-                             DeoptimizeKind kind, DeoptimizeReason reason);
+                             DeoptimizeKind kind, DeoptimizeReason reason,
+                             VectorSlotPair const& feedback);
   DeoptimizationEntry const& GetDeoptimizationEntry(int deoptimization_id);
   int GetDeoptimizationEntryCount() const {
     return static_cast<int>(deoptimization_entries_.size());
@@ -1657,6 +1663,8 @@ struct PrintableInstructionSequence {
 
 V8_EXPORT_PRIVATE std::ostream& operator<<(
     std::ostream& os, const PrintableInstructionSequence& code);
+
+enum class LoadPoisoning { kDoPoison, kDontPoison };
 
 }  // namespace compiler
 }  // namespace internal

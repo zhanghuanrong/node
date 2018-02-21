@@ -75,11 +75,11 @@ void Int64Lowering::LowerGraph() {
 
 namespace {
 
-int GetReturnIndexAfterLowering(
-    CallDescriptor* descriptor, int old_index) {
+int GetReturnIndexAfterLowering(CallDescriptor* call_descriptor,
+                                int old_index) {
   int result = old_index;
   for (int i = 0; i < old_index; i++) {
-    if (descriptor->GetReturnType(i).representation() ==
+    if (call_descriptor->GetReturnType(i).representation() ==
         MachineRepresentation::kWord64) {
       result++;
     }
@@ -87,9 +87,9 @@ int GetReturnIndexAfterLowering(
   return result;
 }
 
-int GetReturnCountAfterLowering(CallDescriptor* descriptor) {
+int GetReturnCountAfterLowering(CallDescriptor* call_descriptor) {
   return GetReturnIndexAfterLowering(
-      descriptor, static_cast<int>(descriptor->ReturnCount()));
+      call_descriptor, static_cast<int>(call_descriptor->ReturnCount()));
 }
 
 int GetParameterIndexAfterLowering(
@@ -314,31 +314,32 @@ void Int64Lowering::LowerNode(Node* node) {
       break;
     }
     case IrOpcode::kTailCall: {
-      CallDescriptor* descriptor =
+      auto call_descriptor =
           const_cast<CallDescriptor*>(CallDescriptorOf(node->op()));
-      if (DefaultLowering(node) ||
-          (descriptor->ReturnCount() == 1 &&
-           descriptor->GetReturnType(0) == MachineType::Int64())) {
+      bool returns_require_lowering =
+          GetReturnCountAfterLowering(call_descriptor) !=
+          static_cast<int>(call_descriptor->ReturnCount());
+      if (DefaultLowering(node) || returns_require_lowering) {
         // Tail calls do not have return values, so adjusting the call
         // descriptor is enough.
-        auto new_descriptor = GetI32WasmCallDescriptor(zone(), descriptor);
+        auto new_descriptor = GetI32WasmCallDescriptor(zone(), call_descriptor);
         NodeProperties::ChangeOp(node, common()->TailCall(new_descriptor));
       }
       break;
     }
     case IrOpcode::kCall: {
-      CallDescriptor* descriptor =
+      auto call_descriptor =
           const_cast<CallDescriptor*>(CallDescriptorOf(node->op()));
       bool returns_require_lowering =
-          GetReturnCountAfterLowering(descriptor) !=
-              static_cast<int>(descriptor->ReturnCount());
+          GetReturnCountAfterLowering(call_descriptor) !=
+          static_cast<int>(call_descriptor->ReturnCount());
       if (DefaultLowering(node) || returns_require_lowering) {
         // We have to adjust the call descriptor.
-        NodeProperties::ChangeOp(
-            node, common()->Call(GetI32WasmCallDescriptor(zone(), descriptor)));
+        NodeProperties::ChangeOp(node, common()->Call(GetI32WasmCallDescriptor(
+                                           zone(), call_descriptor)));
       }
       if (returns_require_lowering) {
-        size_t return_arity = descriptor->ReturnCount();
+        size_t return_arity = call_descriptor->ReturnCount();
         if (return_arity == 1) {
           // We access the additional return values through projections.
           Node* low_node =
@@ -354,14 +355,14 @@ void Int64Lowering::LowerNode(Node* node) {
                ++old_index, ++new_index) {
             Node* use_node = projections[old_index];
             DCHECK_EQ(ProjectionIndexOf(use_node->op()), old_index);
-            DCHECK_EQ(GetReturnIndexAfterLowering(descriptor,
+            DCHECK_EQ(GetReturnIndexAfterLowering(call_descriptor,
                                                   static_cast<int>(old_index)),
                       static_cast<int>(new_index));
             if (new_index != old_index) {
               NodeProperties::ChangeOp(
                   use_node, common()->Projection(new_index));
             }
-            if (descriptor->GetReturnType(old_index).representation() ==
+            if (call_descriptor->GetReturnType(old_index).representation() ==
                 MachineRepresentation::kWord64) {
               Node* high_node = graph()->NewNode(
                   common()->Projection(new_index + 1), node,
@@ -688,7 +689,7 @@ void Int64Lowering::LowerNode(Node* node) {
       Int32Matcher m(shift);
       if (m.HasValue()) {
         // Precondition: 0 <= shift < 64.
-        int32_t shift_value = m.Value() & 0x3f;
+        int32_t shift_value = m.Value() & 0x3F;
         if (shift_value == 0) {
           ReplaceNode(node, GetReplacementLow(input),
                       GetReplacementHigh(input));
@@ -705,7 +706,7 @@ void Int64Lowering::LowerNode(Node* node) {
             low_input = GetReplacementHigh(input);
             high_input = GetReplacementLow(input);
           }
-          int32_t masked_shift_value = shift_value & 0x1f;
+          int32_t masked_shift_value = shift_value & 0x1F;
           Node* masked_shift =
               graph()->NewNode(common()->Int32Constant(masked_shift_value));
           Node* inv_shift = graph()->NewNode(
@@ -726,7 +727,7 @@ void Int64Lowering::LowerNode(Node* node) {
         if (!machine()->Word32ShiftIsSafe()) {
           safe_shift =
               graph()->NewNode(machine()->Word32And(), shift,
-                               graph()->NewNode(common()->Int32Constant(0x1f)));
+                               graph()->NewNode(common()->Int32Constant(0x1F)));
         }
 
         // By creating this bit-mask with SAR and SHL we do not have to deal
@@ -750,7 +751,7 @@ void Int64Lowering::LowerNode(Node* node) {
         if (machine()->Word32ShiftIsSafe()) {
           masked_shift6 =
               graph()->NewNode(machine()->Word32And(), shift,
-                               graph()->NewNode(common()->Int32Constant(0x3f)));
+                               graph()->NewNode(common()->Int32Constant(0x3F)));
         }
 
         Diamond lt32(

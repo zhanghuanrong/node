@@ -71,9 +71,9 @@ void CodeStubDescriptor::Initialize(Register stack_parameter_count,
 
 
 bool CodeStub::FindCodeInCache(Code** code_out) {
-  NumberDictionary* stubs = isolate()->heap()->code_stubs();
+  SimpleNumberDictionary* stubs = isolate()->heap()->code_stubs();
   int index = stubs->FindEntry(isolate(), GetKey());
-  if (index != NumberDictionary::kNotFound) {
+  if (index != SimpleNumberDictionary::kNotFound) {
     *code_out = Code::cast(stubs->ValueAt(index));
     return true;
   }
@@ -97,10 +97,10 @@ void CodeStub::RecordCodeGeneration(Handle<Code> code) {
 
 void CodeStub::DeleteStubFromCacheForTesting() {
   Heap* heap = isolate_->heap();
-  Handle<NumberDictionary> dict(heap->code_stubs());
+  Handle<SimpleNumberDictionary> dict(heap->code_stubs());
   int entry = dict->FindEntry(GetKey());
-  DCHECK_NE(NumberDictionary::kNotFound, entry);
-  dict = NumberDictionary::DeleteEntry(dict, entry);
+  DCHECK_NE(SimpleNumberDictionary::kNotFound, entry);
+  dict = SimpleNumberDictionary::DeleteEntry(dict, entry);
   heap->SetRootCodeStubs(*dict);
 }
 
@@ -166,8 +166,8 @@ Handle<Code> CodeStub::GetCode() {
 #endif
 
     // Update the dictionary and the root in Heap.
-    Handle<NumberDictionary> dict =
-        NumberDictionary::Set(handle(heap->code_stubs()), GetKey(), new_object);
+    Handle<SimpleNumberDictionary> dict = SimpleNumberDictionary::Set(
+        handle(heap->code_stubs()), GetKey(), new_object);
     heap->SetRootCodeStubs(*dict);
     code = *new_object;
   }
@@ -332,7 +332,7 @@ TF_STUB(ElementsTransitionAndStoreStub, CodeStubAssembler) {
     TransitionElementsKind(receiver, map, stub->from_kind(), stub->to_kind(),
                            stub->is_jsarray(), &miss);
     EmitElementStore(receiver, key, value, stub->is_jsarray(), stub->to_kind(),
-                     stub->store_mode(), &miss);
+                     stub->store_mode(), &miss, context);
     Return(value);
   }
 
@@ -402,30 +402,6 @@ TF_STUB(KeyedStoreSloppyArgumentsStub, CodeStubAssembler) {
     TailCallRuntime(Runtime::kKeyedStoreIC_Miss, context, value, slot, vector,
                     receiver, key);
   }
-}
-
-TF_STUB(LoadScriptContextFieldStub, CodeStubAssembler) {
-  Comment("LoadScriptContextFieldStub: context_index=%d, slot=%d",
-          stub->context_index(), stub->slot_index());
-
-  Node* context = Parameter(Descriptor::kContext);
-
-  Node* script_context = LoadScriptContext(context, stub->context_index());
-  Node* result = LoadFixedArrayElement(script_context, stub->slot_index());
-  Return(result);
-}
-
-TF_STUB(StoreScriptContextFieldStub, CodeStubAssembler) {
-  Comment("StoreScriptContextFieldStub: context_index=%d, slot=%d",
-          stub->context_index(), stub->slot_index());
-
-  Node* value = Parameter(Descriptor::kValue);
-  Node* context = Parameter(Descriptor::kContext);
-
-  Node* script_context = LoadScriptContext(context, stub->context_index());
-  StoreFixedArrayElement(script_context, IntPtrConstant(stub->slot_index()),
-                         value);
-  Return(value);
 }
 
 // TODO(ishell): move to builtins-handler-gen.
@@ -548,7 +524,7 @@ TF_STUB(StoreFastElementStub, CodeStubAssembler) {
   Label miss(this);
 
   EmitElementStore(receiver, key, value, stub->is_js_array(),
-                   stub->elements_kind(), stub->store_mode(), &miss);
+                   stub->elements_kind(), stub->store_mode(), &miss, context);
   Return(value);
 
   BIND(&miss);
@@ -565,12 +541,13 @@ void StoreFastElementStub::GenerateAheadOfTime(Isolate* isolate) {
   StoreFastElementStub(isolate, false, HOLEY_ELEMENTS, STANDARD_STORE)
       .GetCode();
   StoreFastElementStub(isolate, false, HOLEY_ELEMENTS,
-                       STORE_AND_GROW_NO_TRANSITION)
+                       STORE_AND_GROW_NO_TRANSITION_HANDLE_COW)
       .GetCode();
   for (int i = FIRST_FAST_ELEMENTS_KIND; i <= LAST_FAST_ELEMENTS_KIND; i++) {
     ElementsKind kind = static_cast<ElementsKind>(i);
     StoreFastElementStub(isolate, true, kind, STANDARD_STORE).GetCode();
-    StoreFastElementStub(isolate, true, kind, STORE_AND_GROW_NO_TRANSITION)
+    StoreFastElementStub(isolate, true, kind,
+                         STORE_AND_GROW_NO_TRANSITION_HANDLE_COW)
         .GetCode();
   }
 }
@@ -640,7 +617,7 @@ void ArrayConstructorAssembler::GenerateConstructor(
     Branch(SmiEqual(array_size, SmiConstant(0)), &small_smi_size, &abort);
 
     BIND(&abort);
-    Node* reason = SmiConstant(kAllocatingNonEmptyPackedArray);
+    Node* reason = SmiConstant(AbortReason::kAllocatingNonEmptyPackedArray);
     TailCallRuntime(Runtime::kAbort, context, reason);
   } else {
     int element_size =
@@ -699,23 +676,6 @@ TF_STUB(InternalArraySingleArgumentConstructorStub, ArrayConstructorAssembler) {
 
   GenerateConstructor(context, function, array_map, array_size, allocation_site,
                       stub->elements_kind(), DONT_TRACK_ALLOCATION_SITE);
-}
-
-TF_STUB(GrowArrayElementsStub, CodeStubAssembler) {
-  Label runtime(this, CodeStubAssembler::Label::kDeferred);
-
-  Node* object = Parameter(Descriptor::kObject);
-  Node* key = Parameter(Descriptor::kKey);
-  Node* context = Parameter(Descriptor::kContext);
-  ElementsKind kind = stub->elements_kind();
-
-  Node* elements = LoadElements(object);
-  Node* new_elements =
-      TryGrowElementsCapacity(object, elements, kind, key, &runtime);
-  Return(new_elements);
-
-  BIND(&runtime);
-  TailCallRuntime(Runtime::kGrowArrayElements, context, object, key);
 }
 
 ArrayConstructorStub::ArrayConstructorStub(Isolate* isolate)

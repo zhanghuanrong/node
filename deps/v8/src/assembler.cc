@@ -131,14 +131,14 @@ static struct V8_ALIGNED(16) {
 static struct V8_ALIGNED(16) {
   uint64_t a;
   uint64_t b;
-} double_absolute_constant = {V8_UINT64_C(0x7FFFFFFFFFFFFFFF),
-                              V8_UINT64_C(0x7FFFFFFFFFFFFFFF)};
+} double_absolute_constant = {uint64_t{0x7FFFFFFFFFFFFFFF},
+                              uint64_t{0x7FFFFFFFFFFFFFFF}};
 
 static struct V8_ALIGNED(16) {
   uint64_t a;
   uint64_t b;
-} double_negate_constant = {V8_UINT64_C(0x8000000000000000),
-                            V8_UINT64_C(0x8000000000000000)};
+} double_negate_constant = {uint64_t{0x8000000000000000},
+                            uint64_t{0x8000000000000000}};
 
 const char* const RelocInfo::kFillerCommentString = "DEOPTIMIZATION PADDING";
 
@@ -176,12 +176,12 @@ AssemblerBase::~AssemblerBase() {
   if (own_buffer_) DeleteArray(buffer_);
 }
 
-void AssemblerBase::FlushICache(Isolate* isolate, void* start, size_t size) {
+void AssemblerBase::FlushICache(void* start, size_t size) {
   if (size == 0) return;
 
 #if defined(USE_SIMULATOR)
-  base::LockGuard<base::Mutex> lock_guard(isolate->simulator_i_cache_mutex());
-  Simulator::FlushICache(isolate->simulator_i_cache(), start, size);
+  base::LockGuard<base::Mutex> lock_guard(Simulator::i_cache_mutex());
+  Simulator::FlushICache(Simulator::i_cache(), start, size);
 #else
   CpuFeatures::FlushICache(start, size);
 #endif  // USE_SIMULATOR
@@ -195,9 +195,6 @@ void AssemblerBase::Print(Isolate* isolate) {
 // -----------------------------------------------------------------------------
 // Implementation of PredictableCodeSizeScope
 
-PredictableCodeSizeScope::PredictableCodeSizeScope(AssemblerBase* assembler)
-    : PredictableCodeSizeScope(assembler, -1) {}
-
 PredictableCodeSizeScope::PredictableCodeSizeScope(AssemblerBase* assembler,
                                                    int expected_size)
     : assembler_(assembler),
@@ -208,10 +205,7 @@ PredictableCodeSizeScope::PredictableCodeSizeScope(AssemblerBase* assembler,
 }
 
 PredictableCodeSizeScope::~PredictableCodeSizeScope() {
-  // TODO(svenpanne) Remove the 'if' when everything works.
-  if (expected_size_ >= 0) {
-    CHECK_EQ(expected_size_, assembler_->pc_offset() - start_offset_);
-  }
+  CHECK_EQ(expected_size_, assembler_->pc_offset() - start_offset_);
   assembler_->set_predictable_code_size(old_value_);
 }
 
@@ -301,16 +295,16 @@ const int kLastChunkTagBits = 1;
 const int kLastChunkTagMask = 1;
 const int kLastChunkTag = 1;
 
-void RelocInfo::set_wasm_context_reference(Isolate* isolate, Address address,
+void RelocInfo::set_wasm_context_reference(Address address,
                                            ICacheFlushMode icache_flush_mode) {
   DCHECK(IsWasmContextReference(rmode_));
-  set_embedded_address(isolate, address, icache_flush_mode);
+  set_embedded_address(address, icache_flush_mode);
 }
 
-void RelocInfo::set_global_handle(Isolate* isolate, Address address,
+void RelocInfo::set_global_handle(Address address,
                                   ICacheFlushMode icache_flush_mode) {
   DCHECK_EQ(rmode_, WASM_GLOBAL_HANDLE);
-  set_embedded_address(isolate, address, icache_flush_mode);
+  set_embedded_address(address, icache_flush_mode);
 }
 
 Address RelocInfo::wasm_call_address() const {
@@ -318,10 +312,10 @@ Address RelocInfo::wasm_call_address() const {
   return Assembler::target_address_at(pc_, constant_pool_);
 }
 
-void RelocInfo::set_wasm_call_address(Isolate* isolate, Address address,
+void RelocInfo::set_wasm_call_address(Address address,
                                       ICacheFlushMode icache_flush_mode) {
   DCHECK_EQ(rmode_, WASM_CALL);
-  Assembler::set_target_address_at(isolate, pc_, constant_pool_, address,
+  Assembler::set_target_address_at(pc_, constant_pool_, address,
                                    icache_flush_mode);
 }
 
@@ -341,17 +335,16 @@ Address RelocInfo::wasm_context_reference() const {
 }
 
 void RelocInfo::update_wasm_function_table_size_reference(
-    Isolate* isolate, uint32_t old_size, uint32_t new_size,
-    ICacheFlushMode icache_flush_mode) {
+    uint32_t old_size, uint32_t new_size, ICacheFlushMode icache_flush_mode) {
   DCHECK(IsWasmFunctionTableSizeReference(rmode_));
-  set_embedded_size(isolate, new_size, icache_flush_mode);
+  set_embedded_size(new_size, icache_flush_mode);
 }
 
-void RelocInfo::set_target_address(Isolate* isolate, Address target,
+void RelocInfo::set_target_address(Address target,
                                    WriteBarrierMode write_barrier_mode,
                                    ICacheFlushMode icache_flush_mode) {
   DCHECK(IsCodeTarget(rmode_) || IsRuntimeEntry(rmode_) || IsWasmCall(rmode_));
-  Assembler::set_target_address_at(isolate, pc_, host_, target,
+  Assembler::set_target_address_at(pc_, constant_pool_, target,
                                    icache_flush_mode);
   if (write_barrier_mode == UPDATE_WRITE_BARRIER && host() != nullptr &&
       IsCodeTarget(rmode_)) {
@@ -449,7 +442,6 @@ void RelocInfoWriter::Write(const RelocInfo* rinfo) {
     }
   }
   last_pc_ = rinfo->pc();
-  last_mode_ = rmode;
 #ifdef DEBUG
   DCHECK_LE(begin_pos - pos_, kMaxSize);
 #endif
@@ -561,7 +553,8 @@ void RelocIterator::next() {
   done_ = true;
 }
 
-RelocIterator::RelocIterator(Code* code, int mode_mask) {
+RelocIterator::RelocIterator(Code* code, int mode_mask)
+    : mode_mask_(mode_mask) {
   rinfo_.host_ = code;
   rinfo_.pc_ = code->instruction_start();
   rinfo_.data_ = 0;
@@ -569,35 +562,30 @@ RelocIterator::RelocIterator(Code* code, int mode_mask) {
   // Relocation info is read backwards.
   pos_ = code->relocation_start() + code->relocation_size();
   end_ = code->relocation_start();
-  done_ = false;
-  mode_mask_ = mode_mask;
   if (mode_mask_ == 0) pos_ = end_;
   next();
 }
 
-RelocIterator::RelocIterator(const CodeDesc& desc, int mode_mask) {
+RelocIterator::RelocIterator(const CodeDesc& desc, int mode_mask)
+    : mode_mask_(mode_mask) {
   rinfo_.pc_ = desc.buffer;
-  rinfo_.data_ = 0;
   // Relocation info is read backwards.
   pos_ = desc.buffer + desc.buffer_size;
   end_ = pos_ - desc.reloc_size;
-  done_ = false;
-  mode_mask_ = mode_mask;
   if (mode_mask_ == 0) pos_ = end_;
   next();
 }
 
 RelocIterator::RelocIterator(Vector<byte> instructions,
                              Vector<const byte> reloc_info, Address const_pool,
-                             int mode_mask) {
+                             int mode_mask)
+    : mode_mask_(mode_mask) {
   rinfo_.pc_ = instructions.start();
-  rinfo_.data_ = 0;
   rinfo_.constant_pool_ = const_pool;
+  rinfo_.flags_ = RelocInfo::kInNativeWasmCode;
   // Relocation info is read backwards.
   pos_ = reloc_info.start() + reloc_info.size();
   end_ = reloc_info.start();
-  done_ = false;
-  mode_mask_ = mode_mask;
   if (mode_mask_ == 0) pos_ = end_;
   next();
 }
@@ -606,7 +594,7 @@ RelocIterator::RelocIterator(Vector<byte> instructions,
 // Implementation of RelocInfo
 
 #ifdef DEBUG
-bool RelocInfo::RequiresRelocation(Isolate* isolate, const CodeDesc& desc) {
+bool RelocInfo::RequiresRelocation(const CodeDesc& desc) {
   // Ensure there are no code targets or embedded objects present in the
   // deoptimization entries, they would require relocation after code
   // generation.
@@ -621,10 +609,8 @@ bool RelocInfo::RequiresRelocation(Isolate* isolate, const CodeDesc& desc) {
 #ifdef ENABLE_DISASSEMBLER
 const char* RelocInfo::RelocModeName(RelocInfo::Mode rmode) {
   switch (rmode) {
-    case NONE32:
-      return "no reloc 32";
-    case NONE64:
-      return "no reloc 64";
+    case NONE:
+      return "no reloc";
     case EMBEDDED_OBJECT:
       return "embedded object";
     case CODE_TARGET:
@@ -686,9 +672,15 @@ void RelocInfo::Print(Isolate* isolate, std::ostream& os) {  // NOLINT
        << ")  (" << static_cast<const void*>(target_external_reference())
        << ")";
   } else if (IsCodeTarget(rmode_)) {
-    Code* code = Code::GetCodeFromTargetAddress(target_address());
-    os << " (" << Code::Kind2String(code->kind()) << ")  ("
-       << static_cast<const void*>(target_address()) << ")";
+    const Address code_target = target_address();
+    if (flags_ & kInNativeWasmCode) {
+      os << " (wasm trampoline) ";
+    } else {
+      Code* code = Code::GetCodeFromTargetAddress(code_target);
+      DCHECK(code->IsCode());
+      os << " (" << Code::Kind2String(code->kind()) << ") ";
+    }
+    os << " (" << static_cast<const void*>(target_address()) << ")";
   } else if (IsRuntimeEntry(rmode_) && isolate->deoptimizer_data() != nullptr) {
     // Depotimization bailouts are stored as runtime entries.
     int id = Deoptimizer::GetDeoptimizationId(
@@ -744,8 +736,7 @@ void RelocInfo::Verify(Isolate* isolate) {
     case WASM_GLOBAL_HANDLE:
     case WASM_CALL:
     case JS_TO_WASM_CALL:
-    case NONE32:
-    case NONE64:
+    case NONE:
       break;
     case NUMBER_OF_MODES:
     case PC_JUMP:
@@ -799,6 +790,16 @@ ExternalReference ExternalReference::isolate_address(Isolate* isolate) {
 
 ExternalReference ExternalReference::builtins_address(Isolate* isolate) {
   return ExternalReference(isolate->builtins()->builtins_table_address());
+}
+
+ExternalReference ExternalReference::handle_scope_implementer_address(
+    Isolate* isolate) {
+  return ExternalReference(isolate->handle_scope_implementer_address());
+}
+
+ExternalReference ExternalReference::pending_microtask_count_address(
+    Isolate* isolate) {
+  return ExternalReference(isolate->pending_microtask_count_address());
 }
 
 ExternalReference ExternalReference::interpreter_dispatch_table_address(
@@ -1000,6 +1001,16 @@ ExternalReference ExternalReference::wasm_word32_popcnt(Isolate* isolate) {
 ExternalReference ExternalReference::wasm_word64_popcnt(Isolate* isolate) {
   return ExternalReference(
       Redirect(isolate, FUNCTION_ADDR(wasm::word64_popcnt_wrapper)));
+}
+
+ExternalReference ExternalReference::wasm_word32_rol(Isolate* isolate) {
+  return ExternalReference(
+      Redirect(isolate, FUNCTION_ADDR(wasm::word32_rol_wrapper)));
+}
+
+ExternalReference ExternalReference::wasm_word32_ror(Isolate* isolate) {
+  return ExternalReference(
+      Redirect(isolate, FUNCTION_ADDR(wasm::word32_ror_wrapper)));
 }
 
 static void f64_acos_wrapper(double* param) {
@@ -1445,6 +1456,12 @@ ExternalReference ExternalReference::copy_typed_array_elements_to_typed_array(
       Redirect(isolate, FUNCTION_ADDR(CopyTypedArrayElementsToTypedArray)));
 }
 
+ExternalReference ExternalReference::copy_typed_array_elements_slice(
+    Isolate* isolate) {
+  return ExternalReference(
+      Redirect(isolate, FUNCTION_ADDR(CopyTypedArrayElementsSlice)));
+}
+
 ExternalReference ExternalReference::try_internalize_string_function(
     Isolate* isolate) {
   return ExternalReference(Redirect(
@@ -1512,6 +1529,12 @@ ExternalReference ExternalReference::runtime_function_table_address(
     Isolate* isolate) {
   return ExternalReference(
       const_cast<Runtime::Function*>(Runtime::RuntimeFunctionTable(isolate)));
+}
+
+ExternalReference ExternalReference::invalidate_prototype_chains_function(
+    Isolate* isolate) {
+  return ExternalReference(
+      Redirect(isolate, FUNCTION_ADDR(JSObject::InvalidatePrototypeChains)));
 }
 
 double power_helper(Isolate* isolate, double x, double y) {
@@ -1849,23 +1872,6 @@ void Assembler::DataAlign(int m) {
 void Assembler::RequestHeapObject(HeapObjectRequest request) {
   request.set_offset(pc_offset());
   heap_object_requests_.push_front(request);
-}
-
-namespace {
-int caller_saved_codes[kNumJSCallerSaved];
-}
-
-void SetUpJSCallerSavedCodeData() {
-  int i = 0;
-  for (int r = 0; r < kNumRegs; r++)
-    if ((kJSCallerSaved & (1 << r)) != 0) caller_saved_codes[i++] = r;
-
-  DCHECK_EQ(i, kNumJSCallerSaved);
-}
-
-int JSCallerSavedCode(int n) {
-  DCHECK(0 <= n && n < kNumJSCallerSaved);
-  return caller_saved_codes[n];
 }
 
 }  // namespace internal

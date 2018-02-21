@@ -47,6 +47,26 @@ namespace internal {
 static void DummyStaticFunction(Object* result) {
 }
 
+void Disassemble(FILE* f, byte* begin, byte* end) {
+  disasm::NameConverter converter;
+  disasm::Disassembler d(converter);
+  for (byte* pc = begin; pc < end;) {
+    v8::internal::EmbeddedVector<char, 128> buffer;
+    buffer[0] = '\0';
+    byte* prev_pc = pc;
+    pc += d.InstructionDecodeForTesting(buffer, pc);
+    fprintf(f, "%p", static_cast<void*>(prev_pc));
+    fprintf(f, "    ");
+
+    for (byte* bp = prev_pc; bp < pc; bp++) {
+      fprintf(f, "%02x", *bp);
+    }
+    for (int i = 6 - static_cast<int>(pc - prev_pc); i >= 0; i--) {
+      fprintf(f, "  ");
+    }
+    fprintf(f, "  %s\n", buffer.start());
+  }
+}
 
 TEST(DisasmX64) {
   CcTest::InitializeVM();
@@ -386,6 +406,10 @@ TEST(DisasmX64) {
     __ cvtsd2ss(xmm0, xmm1);
     __ cvtsd2ss(xmm0, Operand(rbx, rcx, times_4, 10000));
     __ movaps(xmm0, xmm1);
+    __ movdqa(xmm0, Operand(rsp, 12));
+    __ movdqa(Operand(rsp, 12), xmm0);
+    __ movdqu(xmm0, Operand(rsp, 12));
+    __ movdqu(Operand(rsp, 12), xmm0);
     __ shufps(xmm0, xmm9, 0x0);
 
     // logic operation
@@ -451,6 +475,8 @@ TEST(DisasmX64) {
     __ maxsd(xmm1, xmm0);
     __ maxsd(xmm1, Operand(rbx, rcx, times_4, 10000));
     __ ucomisd(xmm0, xmm1);
+    __ haddps(xmm1, xmm0);
+    __ haddps(xmm1, Operand(rbx, rcx, times_4, 10000));
 
     __ andpd(xmm0, xmm1);
     __ andpd(xmm0, Operand(rbx, rcx, times_4, 10000));
@@ -954,7 +980,7 @@ TEST(DisasmX64) {
   code->Print(os);
   byte* begin = code->instruction_start();
   byte* end = begin + code->instruction_size();
-  disasm::Disassembler::Disassemble(stdout, begin, end);
+  Disassemble(stdout, begin, end);
 #endif
 }
 

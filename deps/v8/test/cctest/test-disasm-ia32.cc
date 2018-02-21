@@ -42,7 +42,26 @@ namespace internal {
 
 #define __ assm.
 
+void Disassemble(FILE* f, byte* begin, byte* end) {
+  disasm::NameConverter converter;
+  disasm::Disassembler d(converter);
+  for (byte* pc = begin; pc < end;) {
+    v8::internal::EmbeddedVector<char, 128> buffer;
+    buffer[0] = '\0';
+    byte* prev_pc = pc;
+    pc += d.InstructionDecodeForTesting(buffer, pc);
+    fprintf(f, "%p", static_cast<void*>(prev_pc));
+    fprintf(f, "    ");
 
+    for (byte* bp = prev_pc; bp < pc; bp++) {
+      fprintf(f, "%02x", *bp);
+    }
+    for (int i = 6 - (pc - prev_pc); i >= 0; i--) {
+      fprintf(f, "  ");
+    }
+    fprintf(f, "  %s\n", buffer.start());
+  }
+}
 static void DummyStaticFunction(Object* result) {
 }
 
@@ -69,7 +88,7 @@ TEST(DisasmIa320) {
 
   // ---- All instructions that I can think of
   __ add(edx, ebx);
-  __ add(edx, Operand(12, RelocInfo::NONE32));
+  __ add(edx, Operand(12, RelocInfo::NONE));
   __ add(edx, Operand(ebx, 0));
   __ add(edx, Operand(ebx, 16));
   __ add(edx, Operand(ebx, 1999));
@@ -481,6 +500,8 @@ TEST(DisasmIa320) {
     __ maxsd(xmm1, Operand(ebx, ecx, times_4, 10000));
     __ ucomisd(xmm0, xmm1);
     __ cmpltsd(xmm0, xmm1);
+    __ haddps(xmm1, xmm0);
+    __ haddps(xmm1, Operand(ebx, ecx, times_4, 10000));
 
     __ andpd(xmm0, xmm1);
 
@@ -550,6 +571,8 @@ TEST(DisasmIa320) {
       __ pextrw(Operand(edx, 4), xmm0, 1);
       __ pextrd(eax, xmm0, 1);
       __ pextrd(Operand(edx, 4), xmm0, 1);
+      __ insertps(xmm1, xmm2, 0);
+      __ insertps(xmm1, Operand(edx, 4), 0);
       __ pinsrb(xmm1, eax, 0);
       __ pinsrb(xmm1, Operand(edx, 4), 0);
       __ pinsrd(xmm1, eax, 0);
@@ -611,6 +634,9 @@ TEST(DisasmIa320) {
       __ vrcpps(xmm1, Operand(ebx, ecx, times_4, 10000));
       __ vrsqrtps(xmm1, xmm0);
       __ vrsqrtps(xmm1, Operand(ebx, ecx, times_4, 10000));
+      __ vmovaps(xmm0, xmm1);
+      __ vshufps(xmm0, xmm1, xmm2, 3);
+      __ vshufps(xmm0, xmm1, Operand(edx, 4), 3);
 
       __ vcmpeqps(xmm5, xmm4, xmm1);
       __ vcmpeqps(xmm5, xmm4, Operand(ebx, ecx, times_4, 10000));
@@ -655,6 +681,8 @@ TEST(DisasmIa320) {
       __ vpextrw(Operand(edx, 4), xmm0, 1);
       __ vpextrd(eax, xmm0, 1);
       __ vpextrd(Operand(edx, 4), xmm0, 1);
+      __ vinsertps(xmm0, xmm1, xmm2, 0);
+      __ vinsertps(xmm0, xmm1, Operand(edx, 4), 0);
       __ vpinsrb(xmm0, xmm1, eax, 0);
       __ vpinsrb(xmm0, xmm1, Operand(edx, 4), 0);
       __ vpinsrw(xmm0, xmm1, eax, 0);
@@ -667,6 +695,8 @@ TEST(DisasmIa320) {
       __ vcvttps2dq(xmm1, xmm0);
       __ vcvttps2dq(xmm1, Operand(ebx, ecx, times_4, 10000));
 
+      __ vmovdqu(xmm0, Operand(ebx, ecx, times_4, 10000));
+      __ vmovdqu(Operand(ebx, ecx, times_4, 10000), xmm0);
       __ vmovd(xmm0, edi);
       __ vmovd(xmm0, Operand(ebx, ecx, times_4, 10000));
       __ vmovd(eax, xmm1);
@@ -854,7 +884,7 @@ TEST(DisasmIa320) {
   code->Print(os);
   byte* begin = code->instruction_start();
   byte* end = begin + code->instruction_size();
-  disasm::Disassembler::Disassemble(stdout, begin, end);
+  Disassemble(stdout, begin, end);
 #endif
 }
 

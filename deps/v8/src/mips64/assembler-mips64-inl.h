@@ -33,9 +33,8 @@
 // modified significantly by Google Inc.
 // Copyright 2012 the V8 project authors. All rights reserved.
 
-
-#ifndef V8_MIPS_ASSEMBLER_MIPS_INL_H_
-#define V8_MIPS_ASSEMBLER_MIPS_INL_H_
+#ifndef V8_MIPS64_ASSEMBLER_MIPS64_INL_H_
+#define V8_MIPS64_ASSEMBLER_MIPS64_INL_H_
 
 #include "src/mips64/assembler-mips64.h"
 
@@ -46,8 +45,7 @@
 namespace v8 {
 namespace internal {
 
-
-bool CpuFeatures::SupportsCrankshaft() { return IsSupported(FPU); }
+bool CpuFeatures::SupportsOptimizer() { return IsSupported(FPU); }
 
 bool CpuFeatures::SupportsWasmSimd128() { return IsSupported(MIPS_SIMD); }
 
@@ -77,8 +75,8 @@ void RelocInfo::apply(intptr_t delta) {
 
 
 Address RelocInfo::target_address() {
-  DCHECK(IsCodeTarget(rmode_) || IsRuntimeEntry(rmode_));
-  return Assembler::target_address_at(pc_, host_);
+  DCHECK(IsCodeTarget(rmode_) || IsRuntimeEntry(rmode_) || IsWasmCall(rmode_));
+  return Assembler::target_address_at(pc_, constant_pool_);
 }
 
 Address RelocInfo::target_address_address() {
@@ -116,27 +114,15 @@ int RelocInfo::target_address_size() {
   return Assembler::kSpecialTargetSize;
 }
 
-Address Assembler::target_address_at(Address pc, Code* code) {
-  Address constant_pool = code ? code->constant_pool() : nullptr;
-  return target_address_at(pc, constant_pool);
-}
-
-void Assembler::set_target_address_at(Isolate* isolate, Address pc, Code* code,
-                                      Address target,
-                                      ICacheFlushMode icache_flush_mode) {
-  Address constant_pool = code ? code->constant_pool() : nullptr;
-  set_target_address_at(isolate, pc, constant_pool, target, icache_flush_mode);
-}
-
 Address Assembler::target_address_from_return_address(Address pc) {
   return pc - kCallTargetAddressOffset;
 }
 
 void Assembler::deserialization_set_special_target_at(
-    Isolate* isolate, Address instruction_payload, Code* code, Address target) {
+    Address instruction_payload, Code* code, Address target) {
   set_target_address_at(
-      isolate, instruction_payload - kInstructionsFor64BitConstant * kInstrSize,
-      code, target);
+      instruction_payload - kInstructionsFor64BitConstant * kInstrSize,
+      code ? code->constant_pool() : nullptr, target);
 }
 
 void Assembler::set_target_internal_reference_encoded_at(Address pc,
@@ -156,9 +142,8 @@ void Assembler::set_target_internal_reference_encoded_at(Address pc,
   // after complete deserialization, no need to flush on each reference.
 }
 
-
 void Assembler::deserialization_set_target_internal_reference_at(
-    Isolate* isolate, Address pc, Address target, RelocInfo::Mode mode) {
+    Address pc, Address target, RelocInfo::Mode mode) {
   if (mode == RelocInfo::INTERNAL_REFERENCE_ENCODED) {
     DCHECK(IsJ(instr_at(pc)));
     set_target_internal_reference_encoded_at(pc, target);
@@ -170,21 +155,21 @@ void Assembler::deserialization_set_target_internal_reference_at(
 
 HeapObject* RelocInfo::target_object() {
   DCHECK(IsCodeTarget(rmode_) || rmode_ == EMBEDDED_OBJECT);
-  return HeapObject::cast(
-      reinterpret_cast<Object*>(Assembler::target_address_at(pc_, host_)));
+  return HeapObject::cast(reinterpret_cast<Object*>(
+      Assembler::target_address_at(pc_, constant_pool_)));
 }
 
 Handle<HeapObject> RelocInfo::target_object_handle(Assembler* origin) {
   DCHECK(IsCodeTarget(rmode_) || rmode_ == EMBEDDED_OBJECT);
-  return Handle<HeapObject>(
-      reinterpret_cast<HeapObject**>(Assembler::target_address_at(pc_, host_)));
+  return Handle<HeapObject>(reinterpret_cast<HeapObject**>(
+      Assembler::target_address_at(pc_, constant_pool_)));
 }
 
 void RelocInfo::set_target_object(HeapObject* target,
                                   WriteBarrierMode write_barrier_mode,
                                   ICacheFlushMode icache_flush_mode) {
   DCHECK(IsCodeTarget(rmode_) || rmode_ == EMBEDDED_OBJECT);
-  Assembler::set_target_address_at(target->GetIsolate(), pc_, host_,
+  Assembler::set_target_address_at(pc_, constant_pool_,
                                    reinterpret_cast<Address>(target),
                                    icache_flush_mode);
   if (write_barrier_mode == UPDATE_WRITE_BARRIER && host() != nullptr &&
@@ -198,7 +183,7 @@ void RelocInfo::set_target_object(HeapObject* target,
 
 Address RelocInfo::target_external_reference() {
   DCHECK(rmode_ == EXTERNAL_REFERENCE);
-  return Assembler::target_address_at(pc_, host_);
+  return Assembler::target_address_at(pc_, constant_pool_);
 }
 
 
@@ -229,15 +214,15 @@ Address RelocInfo::target_runtime_entry(Assembler* origin) {
   return target_address();
 }
 
-void RelocInfo::set_target_runtime_entry(Isolate* isolate, Address target,
+void RelocInfo::set_target_runtime_entry(Address target,
                                          WriteBarrierMode write_barrier_mode,
                                          ICacheFlushMode icache_flush_mode) {
   DCHECK(IsRuntimeEntry(rmode_));
   if (target_address() != target)
-    set_target_address(isolate, target, write_barrier_mode, icache_flush_mode);
+    set_target_address(target, write_barrier_mode, icache_flush_mode);
 }
 
-void RelocInfo::WipeOut(Isolate* isolate) {
+void RelocInfo::WipeOut() {
   DCHECK(IsEmbeddedObject(rmode_) || IsCodeTarget(rmode_) ||
          IsRuntimeEntry(rmode_) || IsExternalReference(rmode_) ||
          IsInternalReference(rmode_) || IsInternalReferenceEncoded(rmode_));
@@ -246,12 +231,12 @@ void RelocInfo::WipeOut(Isolate* isolate) {
   } else if (IsInternalReferenceEncoded(rmode_)) {
     Assembler::set_target_internal_reference_encoded_at(pc_, nullptr);
   } else {
-    Assembler::set_target_address_at(isolate, pc_, host_, nullptr);
+    Assembler::set_target_address_at(pc_, constant_pool_, nullptr);
   }
 }
 
 template <typename ObjectVisitor>
-void RelocInfo::Visit(Isolate* isolate, ObjectVisitor* visitor) {
+void RelocInfo::Visit(ObjectVisitor* visitor) {
   RelocInfo::Mode mode = rmode();
   if (mode == RelocInfo::EMBEDDED_OBJECT) {
     visitor->VisitEmbeddedPointer(host(), this);
@@ -355,4 +340,4 @@ EnsureSpace::EnsureSpace(Assembler* assembler) { assembler->CheckBuffer(); }
 }  // namespace internal
 }  // namespace v8
 
-#endif  // V8_MIPS_ASSEMBLER_MIPS_INL_H_
+#endif  // V8_MIPS64_ASSEMBLER_MIPS64_INL_H_

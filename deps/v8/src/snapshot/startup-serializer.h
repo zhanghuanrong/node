@@ -63,7 +63,8 @@ class StartupSerializer : public Serializer<> {
 
   // The StartupSerializer has to serialize the root array, which is slightly
   // different.
-  void VisitRootPointers(Root root, Object** start, Object** end) override;
+  void VisitRootPointers(Root root, const char* description, Object** start,
+                         Object** end) override;
   void SerializeObject(HeapObject* o, HowToCode how_to_code,
                        WhereToPoint where_to_point, int skip) override;
   void Synchronize(VisitorSynchronization::SyncTag tag) override;
@@ -81,6 +82,21 @@ class StartupSerializer : public Serializer<> {
   bool can_be_rehashed_;
 
   DISALLOW_COPY_AND_ASSIGN(StartupSerializer);
+};
+
+class SerializedHandleChecker : public RootVisitor {
+ public:
+  SerializedHandleChecker(Isolate* isolate, std::vector<Context*>* contexts);
+  virtual void VisitRootPointers(Root root, const char* description,
+                                 Object** start, Object** end);
+  bool CheckGlobalAndEternalHandles();
+
+ private:
+  void AddToSet(FixedArray* serialized);
+
+  Isolate* isolate_;
+  std::unordered_set<Object*> serialized_;
+  bool ok_ = true;
 };
 
 }  // namespace internal

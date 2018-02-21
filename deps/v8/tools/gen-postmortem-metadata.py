@@ -164,8 +164,8 @@ consts_misc = [
         'value': 'Map::ElementsKindBits::kMask' },
     { 'name': 'bit_field2_elements_kind_shift',
         'value': 'Map::ElementsKindBits::kShift' },
-    { 'name': 'bit_field3_dictionary_map_shift',
-        'value': 'Map::DictionaryMap::kShift' },
+    { 'name': 'bit_field3_is_dictionary_map_shift',
+        'value': 'Map::IsDictionaryMapBit::kShift' },
     { 'name': 'bit_field3_number_of_own_descriptors_mask',
         'value': 'Map::NumberOfOwnDescriptorsBits::kMask' },
     { 'name': 'bit_field3_number_of_own_descriptors_shift',
@@ -226,6 +226,11 @@ consts_misc = [
         'value': 'NumberDictionaryShape::kPrefixSize' },
     { 'name': 'numberdictionaryshape_entry_size',
         'value': 'NumberDictionaryShape::kEntrySize' },
+
+    { 'name': 'simplenumberdictionaryshape_prefix_size',
+        'value': 'SimpleNumberDictionaryShape::kPrefixSize' },
+    { 'name': 'simplenumberdictionaryshape_entry_size',
+        'value': 'SimpleNumberDictionaryShape::kEntrySize' },
 ];
 
 #

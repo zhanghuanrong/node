@@ -83,17 +83,6 @@ typedef MachineRepresentation UnalignedStoreRepresentation;
 UnalignedStoreRepresentation const& UnalignedStoreRepresentationOf(
     Operator const*);
 
-// A CheckedLoad needs a MachineType.
-typedef MachineType CheckedLoadRepresentation;
-
-CheckedLoadRepresentation CheckedLoadRepresentationOf(Operator const*);
-
-
-// A CheckedStore needs a MachineType.
-typedef MachineRepresentation CheckedStoreRepresentation;
-
-CheckedStoreRepresentation CheckedStoreRepresentationOf(Operator const*);
-
 class StackSlotRepresentation final {
  public:
   StackSlotRepresentation(int size, int alignment)
@@ -154,13 +143,15 @@ class V8_EXPORT_PRIVATE MachineOperatorBuilder final
     kWord64ReverseBytes = 1u << 19,
     kInt32AbsWithOverflow = 1u << 20,
     kInt64AbsWithOverflow = 1u << 21,
+    kSpeculationFence = 1u << 22,
     kAllOptionalOps =
         kFloat32RoundDown | kFloat64RoundDown | kFloat32RoundUp |
         kFloat64RoundUp | kFloat32RoundTruncate | kFloat64RoundTruncate |
         kFloat64RoundTiesAway | kFloat32RoundTiesEven | kFloat64RoundTiesEven |
         kWord32Ctz | kWord64Ctz | kWord32Popcnt | kWord64Popcnt |
         kWord32ReverseBits | kWord64ReverseBits | kWord32ReverseBytes |
-        kWord64ReverseBytes | kInt32AbsWithOverflow | kInt64AbsWithOverflow
+        kWord64ReverseBytes | kInt32AbsWithOverflow | kInt64AbsWithOverflow |
+        kSpeculationFence
   };
   typedef base::Flags<Flag, unsigned> Flags;
 
@@ -358,6 +349,13 @@ class V8_EXPORT_PRIVATE MachineOperatorBuilder final
   const Operator* BitcastFloat64ToInt64();
   const Operator* BitcastInt32ToFloat32();
   const Operator* BitcastInt64ToFloat64();
+
+  // These operators sign-extend to Int32/Int64
+  const Operator* SignExtendWord8ToInt32();
+  const Operator* SignExtendWord16ToInt32();
+  const Operator* SignExtendWord8ToInt64();
+  const Operator* SignExtendWord16ToInt64();
+  const Operator* SignExtendWord32ToInt64();
 
   // Floating point operators always operate with IEEE 754 round-to-nearest
   // (single-precision).
@@ -586,6 +584,7 @@ class V8_EXPORT_PRIVATE MachineOperatorBuilder final
 
   // load [base + index]
   const Operator* Load(LoadRepresentation rep);
+  const Operator* PoisonedLoad(LoadRepresentation rep);
   const Operator* ProtectedLoad(LoadRepresentation rep);
 
   // store [base + index], value
@@ -601,15 +600,14 @@ class V8_EXPORT_PRIVATE MachineOperatorBuilder final
   const Operator* StackSlot(int size, int alignment = 0);
   const Operator* StackSlot(MachineRepresentation rep, int alignment = 0);
 
+  // Returns a value which can be used as a mask to poison values when executing
+  // speculatively.
+  const Operator* SpeculationPoison();
+
   // Access to the machine stack.
   const Operator* LoadStackPointer();
   const Operator* LoadFramePointer();
   const Operator* LoadParentFramePointer();
-
-  // checked-load heap, index, length
-  const Operator* CheckedLoad(CheckedLoadRepresentation);
-  // checked-store heap, index, length, value
-  const Operator* CheckedStore(CheckedStoreRepresentation);
 
   // atomic-load [base + index]
   const Operator* AtomicLoad(LoadRepresentation rep);
@@ -629,6 +627,8 @@ class V8_EXPORT_PRIVATE MachineOperatorBuilder final
   const Operator* AtomicOr(MachineType rep);
   // atomic-xor [base + index], value
   const Operator* AtomicXor(MachineType rep);
+
+  const OptionalOperator SpeculationFence();
 
   // Target machine word-size assumed by this builder.
   bool Is32() const { return word() == MachineRepresentation::kWord32; }

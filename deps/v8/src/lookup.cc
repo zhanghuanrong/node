@@ -211,8 +211,7 @@ Handle<JSReceiver> LookupIterator::GetRootForNonJSReceiver(
   auto root =
       handle(receiver->GetPrototypeChainRootMap(isolate)->prototype(), isolate);
   if (root->IsNull(isolate)) {
-    unsigned int magic = 0xbbbbbbbb;
-    isolate->PushStackTraceAndDie(magic, *receiver, nullptr, magic);
+    isolate->PushStackTraceAndDie(*receiver);
   }
   return Handle<JSReceiver>::cast(root);
 }
@@ -237,35 +236,66 @@ void LookupIterator::ReloadPropertyInformation() {
   DCHECK(IsFound() || !holder_->HasFastProperties());
 }
 
+namespace {
+
+bool IsTypedArrayFunctionInAnyContext(Isolate* isolate, JSReceiver* holder) {
+  static uint32_t context_slots[] = {
+#define TYPED_ARRAY_CONTEXT_SLOTS(Type, type, TYPE, ctype, size) \
+  Context::TYPE##_ARRAY_FUN_INDEX,
+
+      TYPED_ARRAYS(TYPED_ARRAY_CONTEXT_SLOTS)
+#undef TYPED_ARRAY_CONTEXT_SLOTS
+  };
+
+  if (!holder->IsJSFunction()) return false;
+
+  return std::any_of(
+      std::begin(context_slots), std::end(context_slots),
+      [=](uint32_t slot) { return isolate->IsInAnyContext(holder, slot); });
+}
+
+}  // namespace
+
 void LookupIterator::InternalUpdateProtector() {
   if (isolate_->bootstrapper()->IsActive()) return;
 
   if (*name_ == heap()->constructor_string()) {
-    if (!isolate_->IsArraySpeciesLookupChainIntact()) return;
+    if (!isolate_->IsSpeciesLookupChainIntact()) return;
     // Setting the constructor property could change an instance's @@species
-    if (holder_->IsJSArray()) {
+    if (holder_->IsJSArray() || holder_->IsJSPromise() ||
+        holder_->IsJSTypedArray()) {
       isolate_->CountUsage(
           v8::Isolate::UseCounterFeature::kArrayInstanceConstructorModified);
-      isolate_->InvalidateArraySpeciesProtector();
+      isolate_->InvalidateSpeciesProtector();
     } else if (holder_->map()->is_prototype_map()) {
       DisallowHeapAllocation no_gc;
-      // Setting the constructor of Array.prototype of any realm also needs
-      // to invalidate the species protector
+      // Setting the constructor of Array.prototype, Promise.prototype or
+      // %TypedArray%.prototype of any realm also needs to invalidate the
+      // @@species protector.
+      // For typed arrays, we check a prototype of this holder since TypedArrays
+      // have different prototypes for each type, and their parent prototype is
+      // pointing the same TYPED_ARRAY_PROTOTYPE.
       if (isolate_->IsInAnyContext(*holder_,
-                                   Context::INITIAL_ARRAY_PROTOTYPE_INDEX)) {
+                                   Context::INITIAL_ARRAY_PROTOTYPE_INDEX) ||
+          isolate_->IsInAnyContext(*holder_,
+                                   Context::PROMISE_PROTOTYPE_INDEX) ||
+          isolate_->IsInAnyContext(holder_->map()->prototype(),
+                                   Context::TYPED_ARRAY_PROTOTYPE_INDEX)) {
         isolate_->CountUsage(v8::Isolate::UseCounterFeature::
                                  kArrayPrototypeConstructorModified);
-        isolate_->InvalidateArraySpeciesProtector();
+        isolate_->InvalidateSpeciesProtector();
       }
     }
   } else if (*name_ == heap()->species_symbol()) {
-    if (!isolate_->IsArraySpeciesLookupChainIntact()) return;
-    // Setting the Symbol.species property of any Array constructor invalidates
-    // the species protector
-    if (isolate_->IsInAnyContext(*holder_, Context::ARRAY_FUNCTION_INDEX)) {
+    if (!isolate_->IsSpeciesLookupChainIntact()) return;
+    // Setting the Symbol.species property of any Array, Promise or TypedArray
+    // constructor invalidates the @@species protector
+    if (isolate_->IsInAnyContext(*holder_, Context::ARRAY_FUNCTION_INDEX) ||
+        isolate_->IsInAnyContext(*holder_, Context::PROMISE_FUNCTION_INDEX) ||
+        IsTypedArrayFunctionInAnyContext(isolate_, *holder_)) {
       isolate_->CountUsage(
           v8::Isolate::UseCounterFeature::kArraySpeciesModified);
-      isolate_->InvalidateArraySpeciesProtector();
+      isolate_->InvalidateSpeciesProtector();
     }
   } else if (*name_ == heap()->is_concat_spreadable_symbol()) {
     if (!isolate_->IsIsConcatSpreadableLookupChainIntact()) return;
@@ -274,6 +304,14 @@ void LookupIterator::InternalUpdateProtector() {
     if (!isolate_->IsArrayIteratorLookupChainIntact()) return;
     if (holder_->IsJSArray()) {
       isolate_->InvalidateArrayIteratorProtector();
+    }
+  } else if (*name_ == heap()->then_string()) {
+    if (!isolate_->IsPromiseThenLookupChainIntact()) return;
+    // Setting the "then" property on any JSPromise instance or on the
+    // initial %PromisePrototype% invalidates the Promise#then protector.
+    if (holder_->IsJSPromise() ||
+        isolate_->IsInAnyContext(*holder_, Context::PROMISE_PROTOTYPE_INDEX)) {
+      isolate_->InvalidatePromiseThenProtector();
     }
   }
 }
@@ -479,6 +517,7 @@ void LookupIterator::ApplyTransitionToDataProperty(Handle<JSObject> receiver) {
   DCHECK(receiver.is_identical_to(GetStoreTarget()));
   holder_ = receiver;
   if (receiver->IsJSGlobalObject()) {
+    JSObject::InvalidatePrototypeChains(receiver->map());
     state_ = DATA;
     return;
   }
@@ -495,6 +534,9 @@ void LookupIterator::ApplyTransitionToDataProperty(Handle<JSObject> receiver) {
     Handle<NameDictionary> dictionary(receiver->property_dictionary(),
                                       isolate_);
     int entry;
+    if (receiver->map()->is_prototype_map()) {
+      JSObject::InvalidatePrototypeChains(receiver->map());
+    }
     dictionary = NameDictionary::Add(dictionary, name(),
                                      isolate_->factory()->uninitialized_value(),
                                      property_details_, &entry);
@@ -521,8 +563,8 @@ void LookupIterator::Delete() {
     bool is_prototype_map = holder->map()->is_prototype_map();
     RuntimeCallTimerScope stats_scope(
         isolate_, is_prototype_map
-                      ? &RuntimeCallStats::PrototypeObject_DeleteProperty
-                      : &RuntimeCallStats::Object_DeleteProperty);
+                      ? RuntimeCallCounterId::kPrototypeObject_DeleteProperty
+                      : RuntimeCallCounterId::kObject_DeleteProperty);
 
     PropertyNormalizationMode mode =
         is_prototype_map ? KEEP_INOBJECT_PROPERTIES : CLEAR_INOBJECT_PROPERTIES;
@@ -638,9 +680,12 @@ void LookupIterator::TransitionToAccessorPair(Handle<Object> pair,
 
     ReloadPropertyInformation<true>();
   } else {
-    PropertyNormalizationMode mode = receiver->map()->is_prototype_map()
-                                         ? KEEP_INOBJECT_PROPERTIES
-                                         : CLEAR_INOBJECT_PROPERTIES;
+    PropertyNormalizationMode mode = CLEAR_INOBJECT_PROPERTIES;
+    if (receiver->map()->is_prototype_map()) {
+      JSObject::InvalidatePrototypeChains(receiver->map());
+      mode = KEEP_INOBJECT_PROPERTIES;
+    }
+
     // Normalize object to make this operation simple.
     JSObject::NormalizeProperties(receiver, mode, 0,
                                   "TransitionToAccessorPair");
@@ -852,7 +897,7 @@ bool LookupIterator::SkipInterceptor(JSObject* holder) {
     switch (interceptor_state_) {
       case InterceptorState::kUninitialized:
         interceptor_state_ = InterceptorState::kSkipNonMasking;
-      // Fall through.
+        V8_FALLTHROUGH;
       case InterceptorState::kSkipNonMasking:
         return true;
       case InterceptorState::kProcessNonMasking:
@@ -903,13 +948,13 @@ LookupIterator::State LookupIterator::LookupInSpecialHolder(
       if (map->is_access_check_needed()) {
         if (is_element || !name_->IsPrivate()) return ACCESS_CHECK;
       }
-    // Fall through.
+      V8_FALLTHROUGH;
     case ACCESS_CHECK:
       if (check_interceptor() && HasInterceptor<is_element>(map) &&
           !SkipInterceptor<is_element>(JSObject::cast(holder))) {
         if (is_element || !name_->IsPrivate()) return INTERCEPTOR;
       }
-    // Fall through.
+      V8_FALLTHROUGH;
     case INTERCEPTOR:
       if (!is_element && map->IsJSGlobalObjectMap()) {
         GlobalDictionary* dict =

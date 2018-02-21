@@ -92,8 +92,9 @@ bool Serializer<AllocatorT>::MustBeDeferred(HeapObject* object) {
 }
 
 template <class AllocatorT>
-void Serializer<AllocatorT>::VisitRootPointers(Root root, Object** start,
-                                               Object** end) {
+void Serializer<AllocatorT>::VisitRootPointers(Root root,
+                                               const char* description,
+                                               Object** start, Object** end) {
   // Builtins and bytecode handlers are serialized in a separate pass by the
   // BuiltinSerializer.
   if (root == Root::kBuiltins || root == Root::kDispatchTable) return;
@@ -454,13 +455,24 @@ void Serializer<AllocatorT>::ObjectSerializer::SerializeJSArrayBuffer() {
 template <class AllocatorT>
 void Serializer<AllocatorT>::ObjectSerializer::SerializeExternalString() {
   Heap* heap = serializer_->isolate()->heap();
+  // For external strings with known resources, we replace the resource field
+  // with the encoded external reference, which we restore upon deserialize.
+  // for native native source code strings, we replace the resource field
+  // with the native source id.
+  // For the rest we serialize them to look like ordinary sequential strings.
   if (object_->map() != heap->native_source_string_map()) {
-    // Usually we cannot recreate resources for external strings. To work
-    // around this, external strings are serialized to look like ordinary
-    // sequential strings.
-    // The exception are native source code strings, since we can recreate
-    // their resources.
-    SerializeExternalStringAsSequentialString();
+    ExternalString* string = ExternalString::cast(object_);
+    Address resource = string->resource_as_address();
+    ExternalReferenceEncoder::Value reference;
+    if (serializer_->external_reference_encoder_.TryEncode(resource).To(
+            &reference)) {
+      DCHECK(reference.is_from_api());
+      string->set_uint32_as_resource(reference.index());
+      SerializeObject();
+      string->set_address_as_resource(resource);
+    } else {
+      SerializeExternalStringAsSequentialString();
+    }
   } else {
     ExternalOneByteString* string = ExternalOneByteString::cast(object_);
     DCHECK(string->is_short());
@@ -874,7 +886,7 @@ void Serializer<AllocatorT>::ObjectSerializer::OutputCode(int size) {
                     RelocInfo::ModeMask(RelocInfo::INTERNAL_REFERENCE_ENCODED);
     for (RelocIterator it(code, mode_mask); !it.done(); it.next()) {
       RelocInfo* rinfo = it.rinfo();
-      rinfo->WipeOut(serializer_->isolate());
+      rinfo->WipeOut();
     }
     // We need to wipe out the header fields *after* wiping out the
     // relocations, because some of these fields are needed for the latter.

@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include "src/api.h"
 #include "src/builtins/builtins-utils-gen.h"
 #include "src/builtins/builtins.h"
 #include "src/code-stub-assembler.h"
@@ -12,6 +13,9 @@
 
 namespace v8 {
 namespace internal {
+
+template <typename T>
+using TNode = compiler::TNode<T>;
 
 // -----------------------------------------------------------------------------
 // Interrupt and stack checks.
@@ -583,7 +587,7 @@ TF_BUILTIN(ForInFilter, CodeStubAssembler) {
   CSA_ASSERT(this, IsString(key));
 
   Label if_true(this), if_false(this);
-  Node* result = HasProperty(object, key, context, kForInHasProperty);
+  TNode<Oddball> result = HasProperty(object, key, context, kForInHasProperty);
   Branch(IsTrue(result), &if_true, &if_false);
 
   BIND(&if_true);
@@ -605,6 +609,443 @@ TF_BUILTIN(SameValue, CodeStubAssembler) {
 
   BIND(&if_false);
   Return(FalseConstant());
+}
+
+class InternalBuiltinsAssembler : public CodeStubAssembler {
+ public:
+  explicit InternalBuiltinsAssembler(compiler::CodeAssemblerState* state)
+      : CodeStubAssembler(state) {}
+
+  TNode<IntPtrT> GetPendingMicrotaskCount();
+  void SetPendingMicrotaskCount(TNode<IntPtrT> count);
+
+  TNode<FixedArray> GetMicrotaskQueue();
+  void SetMicrotaskQueue(TNode<FixedArray> queue);
+
+  TNode<Context> GetCurrentContext();
+  void SetCurrentContext(TNode<Context> context);
+
+  void EnterMicrotaskContext(TNode<Context> context);
+  void LeaveMicrotaskContext();
+
+  void RunPromiseHook(Runtime::FunctionId id, TNode<Context> context,
+                      SloppyTNode<HeapObject> payload);
+
+  TNode<Object> GetPendingException() {
+    auto ref = ExternalReference(kPendingExceptionAddress, isolate());
+    return TNode<Object>::UncheckedCast(
+        Load(MachineType::AnyTagged(), ExternalConstant(ref)));
+  }
+  void ClearPendingException() {
+    auto ref = ExternalReference(kPendingExceptionAddress, isolate());
+    StoreNoWriteBarrier(MachineRepresentation::kTagged, ExternalConstant(ref),
+                        TheHoleConstant());
+  }
+
+  TNode<Object> GetScheduledException() {
+    auto ref = ExternalReference::scheduled_exception_address(isolate());
+    return TNode<Object>::UncheckedCast(
+        Load(MachineType::AnyTagged(), ExternalConstant(ref)));
+  }
+  void ClearScheduledException() {
+    auto ref = ExternalReference::scheduled_exception_address(isolate());
+    StoreNoWriteBarrier(MachineRepresentation::kTagged, ExternalConstant(ref),
+                        TheHoleConstant());
+  }
+};
+
+TNode<IntPtrT> InternalBuiltinsAssembler::GetPendingMicrotaskCount() {
+  auto ref = ExternalReference::pending_microtask_count_address(isolate());
+  if (kIntSize == 8) {
+    return TNode<IntPtrT>::UncheckedCast(
+        Load(MachineType::Int64(), ExternalConstant(ref)));
+  } else {
+    Node* const value = Load(MachineType::Int32(), ExternalConstant(ref));
+    return ChangeInt32ToIntPtr(value);
+  }
+}
+
+void InternalBuiltinsAssembler::SetPendingMicrotaskCount(TNode<IntPtrT> count) {
+  auto ref = ExternalReference::pending_microtask_count_address(isolate());
+  auto rep = kIntSize == 8 ? MachineRepresentation::kWord64
+                           : MachineRepresentation::kWord32;
+  if (kIntSize == 4 && kPointerSize == 8) {
+    Node* const truncated_count =
+        TruncateInt64ToInt32(TNode<Int64T>::UncheckedCast(count));
+    StoreNoWriteBarrier(rep, ExternalConstant(ref), truncated_count);
+  } else {
+    StoreNoWriteBarrier(rep, ExternalConstant(ref), count);
+  }
+}
+
+TNode<FixedArray> InternalBuiltinsAssembler::GetMicrotaskQueue() {
+  return TNode<FixedArray>::UncheckedCast(
+      LoadRoot(Heap::kMicrotaskQueueRootIndex));
+}
+
+void InternalBuiltinsAssembler::SetMicrotaskQueue(TNode<FixedArray> queue) {
+  StoreRoot(Heap::kMicrotaskQueueRootIndex, queue);
+}
+
+TNode<Context> InternalBuiltinsAssembler::GetCurrentContext() {
+  auto ref = ExternalReference(kContextAddress, isolate());
+  return TNode<Context>::UncheckedCast(
+      Load(MachineType::AnyTagged(), ExternalConstant(ref)));
+}
+
+void InternalBuiltinsAssembler::SetCurrentContext(TNode<Context> context) {
+  auto ref = ExternalReference(kContextAddress, isolate());
+  StoreNoWriteBarrier(MachineRepresentation::kTagged, ExternalConstant(ref),
+                      context);
+}
+
+void InternalBuiltinsAssembler::EnterMicrotaskContext(
+    TNode<Context> microtask_context) {
+  auto ref = ExternalReference::handle_scope_implementer_address(isolate());
+  Node* const hsi = Load(MachineType::Pointer(), ExternalConstant(ref));
+  StoreNoWriteBarrier(
+      MachineType::PointerRepresentation(), hsi,
+      IntPtrConstant(HandleScopeImplementerOffsets::kMicrotaskContext),
+      BitcastTaggedToWord(microtask_context));
+
+  // Load mirrored std::vector length from
+  // HandleScopeImplementer::entered_contexts_count_
+  auto type = kSizetSize == 8 ? MachineType::Uint64() : MachineType::Uint32();
+  Node* entered_contexts_length = Load(
+      type, hsi,
+      IntPtrConstant(HandleScopeImplementerOffsets::kEnteredContextsCount));
+
+  auto rep = kSizetSize == 8 ? MachineRepresentation::kWord64
+                             : MachineRepresentation::kWord32;
+
+  StoreNoWriteBarrier(
+      rep, hsi,
+      IntPtrConstant(
+          HandleScopeImplementerOffsets::kEnteredContextCountDuringMicrotasks),
+      entered_contexts_length);
+}
+
+void InternalBuiltinsAssembler::LeaveMicrotaskContext() {
+  auto ref = ExternalReference::handle_scope_implementer_address(isolate());
+
+  Node* const hsi = Load(MachineType::Pointer(), ExternalConstant(ref));
+  StoreNoWriteBarrier(
+      MachineType::PointerRepresentation(), hsi,
+      IntPtrConstant(HandleScopeImplementerOffsets::kMicrotaskContext),
+      IntPtrConstant(0));
+  if (kSizetSize == 4) {
+    StoreNoWriteBarrier(
+        MachineRepresentation::kWord32, hsi,
+        IntPtrConstant(HandleScopeImplementerOffsets::
+                           kEnteredContextCountDuringMicrotasks),
+        Int32Constant(0));
+  } else {
+    StoreNoWriteBarrier(
+        MachineRepresentation::kWord64, hsi,
+        IntPtrConstant(HandleScopeImplementerOffsets::
+                           kEnteredContextCountDuringMicrotasks),
+        Int64Constant(0));
+  }
+}
+
+void InternalBuiltinsAssembler::RunPromiseHook(
+    Runtime::FunctionId id, TNode<Context> context,
+    SloppyTNode<HeapObject> payload) {
+  Label hook(this, Label::kDeferred), done_hook(this);
+  Branch(IsPromiseHookEnabledOrDebugIsActive(), &hook, &done_hook);
+  BIND(&hook);
+  {
+    CallRuntime(id, context, payload);
+    Goto(&done_hook);
+  }
+  BIND(&done_hook);
+}
+
+TF_BUILTIN(EnqueueMicrotask, InternalBuiltinsAssembler) {
+  Node* microtask = Parameter(Descriptor::kMicrotask);
+
+  TNode<IntPtrT> num_tasks = GetPendingMicrotaskCount();
+  TNode<IntPtrT> new_num_tasks = IntPtrAdd(num_tasks, IntPtrConstant(1));
+  TNode<FixedArray> queue = GetMicrotaskQueue();
+  TNode<IntPtrT> queue_length = LoadAndUntagFixedArrayBaseLength(queue);
+
+  Label if_append(this), if_grow(this), done(this);
+  Branch(WordEqual(num_tasks, queue_length), &if_grow, &if_append);
+
+  BIND(&if_grow);
+  {
+    // Determine the new queue length and check if we need to allocate
+    // in large object space (instead of just going to new space, where
+    // we also know that we don't need any write barriers for setting
+    // up the new queue object).
+    Label if_newspace(this), if_lospace(this, Label::kDeferred);
+    TNode<IntPtrT> new_queue_length =
+        IntPtrMax(IntPtrConstant(8), IntPtrAdd(num_tasks, num_tasks));
+    Branch(IntPtrLessThanOrEqual(new_queue_length,
+                                 IntPtrConstant(FixedArray::kMaxRegularLength)),
+           &if_newspace, &if_lospace);
+
+    BIND(&if_newspace);
+    {
+      // This is the likely case where the new queue fits into new space,
+      // and thus we don't need any write barriers for initializing it.
+      TNode<FixedArray> new_queue =
+          CAST(AllocateFixedArray(PACKED_ELEMENTS, new_queue_length));
+      CopyFixedArrayElements(PACKED_ELEMENTS, queue, new_queue, num_tasks,
+                             SKIP_WRITE_BARRIER);
+      StoreFixedArrayElement(new_queue, num_tasks, microtask,
+                             SKIP_WRITE_BARRIER);
+      FillFixedArrayWithValue(PACKED_ELEMENTS, new_queue, new_num_tasks,
+                              new_queue_length, Heap::kUndefinedValueRootIndex);
+      SetMicrotaskQueue(new_queue);
+      Goto(&done);
+    }
+
+    BIND(&if_lospace);
+    {
+      // The fallback case where the new queue ends up in large object space.
+      TNode<FixedArray> new_queue = CAST(AllocateFixedArray(
+          PACKED_ELEMENTS, new_queue_length, INTPTR_PARAMETERS,
+          AllocationFlag::kAllowLargeObjectAllocation));
+      CopyFixedArrayElements(PACKED_ELEMENTS, queue, new_queue, num_tasks);
+      StoreFixedArrayElement(new_queue, num_tasks, microtask);
+      FillFixedArrayWithValue(PACKED_ELEMENTS, new_queue, new_num_tasks,
+                              new_queue_length, Heap::kUndefinedValueRootIndex);
+      SetMicrotaskQueue(new_queue);
+      Goto(&done);
+    }
+  }
+
+  BIND(&if_append);
+  {
+    StoreFixedArrayElement(queue, num_tasks, microtask);
+    Goto(&done);
+  }
+
+  BIND(&done);
+  SetPendingMicrotaskCount(new_num_tasks);
+  Return(UndefinedConstant());
+}
+
+TF_BUILTIN(RunMicrotasks, InternalBuiltinsAssembler) {
+  // Load the current context from the isolate.
+  TNode<Context> current_context = GetCurrentContext();
+
+  Label init_queue_loop(this);
+  Goto(&init_queue_loop);
+  BIND(&init_queue_loop);
+  {
+    TVARIABLE(IntPtrT, index, IntPtrConstant(0));
+    Label loop(this, &index), loop_next(this);
+
+    TNode<IntPtrT> num_tasks = GetPendingMicrotaskCount();
+    ReturnIf(IntPtrEqual(num_tasks, IntPtrConstant(0)), UndefinedConstant());
+
+    TNode<FixedArray> queue = GetMicrotaskQueue();
+
+    CSA_ASSERT(this, IntPtrGreaterThanOrEqual(
+                         LoadAndUntagFixedArrayBaseLength(queue), num_tasks));
+    CSA_ASSERT(this, IntPtrGreaterThan(num_tasks, IntPtrConstant(0)));
+
+    SetPendingMicrotaskCount(IntPtrConstant(0));
+    SetMicrotaskQueue(
+        TNode<FixedArray>::UncheckedCast(EmptyFixedArrayConstant()));
+
+    Goto(&loop);
+    BIND(&loop);
+    {
+      TNode<HeapObject> microtask = TNode<HeapObject>::UncheckedCast(
+          LoadFixedArrayElement(queue, index.value()));
+      index = IntPtrAdd(index.value(), IntPtrConstant(1));
+
+      CSA_ASSERT(this, TaggedIsNotSmi(microtask));
+
+      TNode<Map> microtask_map = LoadMap(microtask);
+      TNode<Int32T> microtask_type = LoadMapInstanceType(microtask_map);
+
+      VARIABLE(var_exception, MachineRepresentation::kTagged,
+               TheHoleConstant());
+      Label if_exception(this, Label::kDeferred);
+      Label is_callable(this), is_callback(this),
+          is_promise_fulfill_reaction_job(this),
+          is_promise_reject_reaction_job(this),
+          is_promise_resolve_thenable_job(this),
+          is_unreachable(this, Label::kDeferred);
+
+      int32_t case_values[] = {CALLABLE_TASK_TYPE, CALLBACK_TASK_TYPE,
+                               PROMISE_FULFILL_REACTION_JOB_TASK_TYPE,
+                               PROMISE_REJECT_REACTION_JOB_TASK_TYPE,
+                               PROMISE_RESOLVE_THENABLE_JOB_TASK_TYPE};
+      Label* case_labels[] = {
+          &is_callable, &is_callback, &is_promise_fulfill_reaction_job,
+          &is_promise_reject_reaction_job, &is_promise_resolve_thenable_job};
+      static_assert(arraysize(case_values) == arraysize(case_labels), "");
+      Switch(microtask_type, &is_unreachable, case_values, case_labels,
+             arraysize(case_labels));
+
+      BIND(&is_callable);
+      {
+        // Enter the context of the {microtask}.
+        TNode<Context> microtask_context = TNode<Context>::UncheckedCast(
+            LoadObjectField(microtask, CallableTask::kContextOffset));
+        TNode<Context> native_context =
+            TNode<Context>::UncheckedCast(LoadNativeContext(microtask_context));
+        CSA_ASSERT(this, IsNativeContext(native_context));
+        EnterMicrotaskContext(microtask_context);
+        SetCurrentContext(native_context);
+
+        TNode<JSReceiver> callable = TNode<JSReceiver>::UncheckedCast(
+            LoadObjectField(microtask, CallableTask::kCallableOffset));
+        Node* const result = CallJS(
+            CodeFactory::Call(isolate(), ConvertReceiverMode::kNullOrUndefined),
+            microtask_context, callable, UndefinedConstant());
+        GotoIfException(result, &if_exception, &var_exception);
+        LeaveMicrotaskContext();
+        SetCurrentContext(current_context);
+        Goto(&loop_next);
+      }
+
+      BIND(&is_callback);
+      {
+        Node* const microtask_callback =
+            LoadObjectField(microtask, CallbackTask::kCallbackOffset);
+        Node* const microtask_data =
+            LoadObjectField(microtask, CallbackTask::kDataOffset);
+
+        // If this turns out to become a bottleneck because of the calls
+        // to C++ via CEntryStub, we can choose to speed them up using a
+        // similar mechanism that we use for the CallApiFunction stub,
+        // except that calling the MicrotaskCallback is even easier, since
+        // it doesn't accept any tagged parameters, doesn't return a value
+        // and ignores exceptions.
+        //
+        // But from our current measurements it doesn't seem to be a
+        // serious performance problem, even if the microtask is full
+        // of CallHandlerTasks (which is not a realistic use case anyways).
+        CallRuntime(Runtime::kRunMicrotaskCallback, current_context,
+                    microtask_callback, microtask_data);
+        Goto(&loop_next);
+      }
+
+      BIND(&is_promise_resolve_thenable_job);
+      {
+        // Enter the context of the {microtask}.
+        TNode<Context> microtask_context =
+            TNode<Context>::UncheckedCast(LoadObjectField(
+                microtask, PromiseResolveThenableJobTask::kContextOffset));
+        TNode<Context> native_context =
+            TNode<Context>::UncheckedCast(LoadNativeContext(microtask_context));
+        CSA_ASSERT(this, IsNativeContext(native_context));
+        EnterMicrotaskContext(microtask_context);
+        SetCurrentContext(native_context);
+
+        Node* const promise_to_resolve = LoadObjectField(
+            microtask, PromiseResolveThenableJobTask::kPromiseToResolveOffset);
+        Node* const then = LoadObjectField(
+            microtask, PromiseResolveThenableJobTask::kThenOffset);
+        Node* const thenable = LoadObjectField(
+            microtask, PromiseResolveThenableJobTask::kThenableOffset);
+
+        Node* const result =
+            CallBuiltin(Builtins::kPromiseResolveThenableJob, native_context,
+                        promise_to_resolve, thenable, then);
+        GotoIfException(result, &if_exception, &var_exception);
+        LeaveMicrotaskContext();
+        SetCurrentContext(current_context);
+        Goto(&loop_next);
+      }
+
+      BIND(&is_promise_fulfill_reaction_job);
+      {
+        // Enter the context of the {microtask}.
+        TNode<Context> microtask_context = TNode<Context>::UncheckedCast(
+            LoadObjectField(microtask, PromiseReactionJobTask::kContextOffset));
+        TNode<Context> native_context =
+            TNode<Context>::UncheckedCast(LoadNativeContext(microtask_context));
+        CSA_ASSERT(this, IsNativeContext(native_context));
+        EnterMicrotaskContext(microtask_context);
+        SetCurrentContext(native_context);
+
+        Node* const argument =
+            LoadObjectField(microtask, PromiseReactionJobTask::kArgumentOffset);
+        Node* const handler =
+            LoadObjectField(microtask, PromiseReactionJobTask::kHandlerOffset);
+        Node* const payload =
+            LoadObjectField(microtask, PromiseReactionJobTask::kPayloadOffset);
+
+        // Run the promise before/debug hook if enabled.
+        RunPromiseHook(Runtime::kPromiseHookBefore, microtask_context, payload);
+
+        Node* const result =
+            CallBuiltin(Builtins::kPromiseFulfillReactionJob, microtask_context,
+                        argument, handler, payload);
+        GotoIfException(result, &if_exception, &var_exception);
+
+        // Run the promise after/debug hook if enabled.
+        RunPromiseHook(Runtime::kPromiseHookAfter, microtask_context, payload);
+
+        LeaveMicrotaskContext();
+        SetCurrentContext(current_context);
+        Goto(&loop_next);
+      }
+
+      BIND(&is_promise_reject_reaction_job);
+      {
+        // Enter the context of the {microtask}.
+        TNode<Context> microtask_context = TNode<Context>::UncheckedCast(
+            LoadObjectField(microtask, PromiseReactionJobTask::kContextOffset));
+        TNode<Context> native_context =
+            TNode<Context>::UncheckedCast(LoadNativeContext(microtask_context));
+        CSA_ASSERT(this, IsNativeContext(native_context));
+        EnterMicrotaskContext(microtask_context);
+        SetCurrentContext(native_context);
+
+        Node* const argument =
+            LoadObjectField(microtask, PromiseReactionJobTask::kArgumentOffset);
+        Node* const handler =
+            LoadObjectField(microtask, PromiseReactionJobTask::kHandlerOffset);
+        Node* const payload =
+            LoadObjectField(microtask, PromiseReactionJobTask::kPayloadOffset);
+
+        // Run the promise before/debug hook if enabled.
+        RunPromiseHook(Runtime::kPromiseHookBefore, microtask_context, payload);
+
+        Node* const result =
+            CallBuiltin(Builtins::kPromiseRejectReactionJob, microtask_context,
+                        argument, handler, payload);
+        GotoIfException(result, &if_exception, &var_exception);
+
+        // Run the promise after/debug hook if enabled.
+        RunPromiseHook(Runtime::kPromiseHookAfter, microtask_context, payload);
+
+        LeaveMicrotaskContext();
+        SetCurrentContext(current_context);
+        Goto(&loop_next);
+      }
+
+      BIND(&is_unreachable);
+      Unreachable();
+
+      BIND(&if_exception);
+      {
+        // Report unhandled exceptions from microtasks.
+        CallRuntime(Runtime::kReportMessage, current_context,
+                    var_exception.value());
+        LeaveMicrotaskContext();
+        SetCurrentContext(current_context);
+        Goto(&loop_next);
+      }
+
+      BIND(&loop_next);
+      Branch(IntPtrLessThan(index.value(), num_tasks), &loop, &init_queue_loop);
+    }
+  }
+}
+
+TF_BUILTIN(AbortJS, CodeStubAssembler) {
+  Node* message = Parameter(Descriptor::kObject);
+  Node* reason = SmiConstant(0);
+  TailCallRuntime(Runtime::kAbortJS, reason, message);
 }
 
 }  // namespace internal

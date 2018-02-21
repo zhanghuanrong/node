@@ -27,12 +27,11 @@ namespace compiler {
 // expression will be evaluated at runtime. If it evaluates to false, then an
 // error message will be shown containing the condition, as well as the extra
 // info formatted like with printf.
-#define CHECK_EXTRA(condition, fmt, ...)                                 \
-  do {                                                                   \
-    if (V8_UNLIKELY(!(condition))) {                                     \
-      V8_Fatal(__FILE__, __LINE__, "Check failed: %s. Extra info: " fmt, \
-               #condition, ##__VA_ARGS__);                               \
-    }                                                                    \
+#define CHECK_EXTRA(condition, fmt, ...)                                      \
+  do {                                                                        \
+    if (V8_UNLIKELY(!(condition))) {                                          \
+      FATAL("Check failed: %s. Extra info: " fmt, #condition, ##__VA_ARGS__); \
+    }                                                                         \
   } while (0)
 
 #ifdef DEBUG
@@ -326,13 +325,11 @@ UnobservablesSet RedundantStoreFinder::RecomputeSet(Node* node,
 }
 
 bool RedundantStoreFinder::CannotObserveStoreField(Node* node) {
-  return node->opcode() == IrOpcode::kCheckedLoad ||
-         node->opcode() == IrOpcode::kLoadElement ||
+  return node->opcode() == IrOpcode::kLoadElement ||
          node->opcode() == IrOpcode::kLoad ||
          node->opcode() == IrOpcode::kStore ||
          node->opcode() == IrOpcode::kEffectPhi ||
          node->opcode() == IrOpcode::kStoreElement ||
-         node->opcode() == IrOpcode::kCheckedStore ||
          node->opcode() == IrOpcode::kUnsafePointerAdd ||
          node->opcode() == IrOpcode::kRetain;
 }

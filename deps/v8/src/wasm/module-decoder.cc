@@ -21,14 +21,11 @@ namespace v8 {
 namespace internal {
 namespace wasm {
 
-#if DEBUG
 #define TRACE(...)                                    \
   do {                                                \
     if (FLAG_trace_wasm_decoder) PrintF(__VA_ARGS__); \
   } while (false)
-#else
-#define TRACE(...)
-#endif
+
 namespace {
 
 constexpr char kNameString[] = "name";
@@ -38,6 +35,20 @@ constexpr char kUnknownString[] = "<unknown>";
 template <size_t N>
 constexpr size_t num_chars(const char (&)[N]) {
   return N - 1;  // remove null character at end.
+}
+
+const char* ExternalKindName(ImportExportKindCode kind) {
+  switch (kind) {
+    case kExternalFunction:
+      return "function";
+    case kExternalTable:
+      return "table";
+    case kExternalMemory:
+      return "memory";
+    case kExternalGlobal:
+      return "global";
+  }
+  return "unknown";
 }
 
 }  // namespace
@@ -259,7 +270,7 @@ class ModuleDecoderImpl : public Decoder {
     pc_ = end_;  // On error, terminate section decoding loop.
   }
 
-  void DumpModule(const ModuleResult& result) {
+  void DumpModule(const Vector<const byte> module_bytes) {
     std::string path;
     if (FLAG_dump_wasm_module_path) {
       path = FLAG_dump_wasm_module_path;
@@ -269,12 +280,13 @@ class ModuleDecoderImpl : public Decoder {
       }
     }
     // File are named `HASH.{ok,failed}.wasm`.
-    size_t hash = base::hash_range(start_, end_);
+    size_t hash = base::hash_range(module_bytes.start(), module_bytes.end());
     EmbeddedVector<char, 32> buf;
-    SNPrintF(buf, "%016zx.%s.wasm", hash, result.ok() ? "ok" : "failed");
+    SNPrintF(buf, "%016zx.%s.wasm", hash, ok() ? "ok" : "failed");
     std::string name(buf.start());
     if (FILE* wasm_file = base::OS::FOpen((path + name).c_str(), "wb")) {
-      if (fwrite(start_, end_ - start_, 1, wasm_file) != 1) {
+      if (fwrite(module_bytes.start(), module_bytes.length(), 1, wasm_file) !=
+          1) {
         OFStream os(stderr);
         os << "Error while dumping wasm file" << std::endl;
       }
@@ -299,7 +311,7 @@ class ModuleDecoderImpl : public Decoder {
 
     const byte* pos = pc_;
     uint32_t magic_word = consume_u32("wasm magic");
-#define BYTES(x) (x & 0xff), (x >> 8) & 0xff, (x >> 16) & 0xff, (x >> 24) & 0xff
+#define BYTES(x) (x & 0xFF), (x >> 8) & 0xFF, (x >> 16) & 0xFF, (x >> 24) & 0xFF
     if (magic_word != kWasmMagic) {
       errorf(pos,
              "expected magic word %02x %02x %02x %02x, "
@@ -446,7 +458,8 @@ class ModuleDecoderImpl : public Decoder {
       const byte* pos = pc_;
       import->module_name = consume_string(true, "module name");
       import->field_name = consume_string(true, "field name");
-      import->kind = static_cast<WasmExternalKind>(consume_u8("import kind"));
+      import->kind =
+          static_cast<ImportExportKindCode>(consume_u8("import kind"));
       switch (import->kind) {
         case kExternalFunction: {
           // ===== Imported function =======================================
@@ -472,7 +485,7 @@ class ModuleDecoderImpl : public Decoder {
           module_->function_tables.emplace_back();
           WasmIndirectFunctionTable* table = &module_->function_tables.back();
           table->imported = true;
-          expect_u8("element type", kWasmAnyFunctionTypeForm);
+          expect_u8("element type", kWasmAnyFunctionTypeCode);
           consume_resizable_limits(
               "element count", "elements", FLAG_wasm_max_table_size,
               &table->initial_size, &table->has_maximum_size,
@@ -538,7 +551,7 @@ class ModuleDecoderImpl : public Decoder {
       if (!AddTable(module_.get())) break;
       module_->function_tables.emplace_back();
       WasmIndirectFunctionTable* table = &module_->function_tables.back();
-      expect_u8("table type", kWasmAnyFunctionTypeForm);
+      expect_u8("table type", kWasmAnyFunctionTypeCode);
       consume_resizable_limits("table elements", "elements",
                                FLAG_wasm_max_table_size, &table->initial_size,
                                &table->has_maximum_size,
@@ -591,7 +604,7 @@ class ModuleDecoderImpl : public Decoder {
       exp->name = consume_string(true, "field name");
 
       const byte* pos = pc();
-      exp->kind = static_cast<WasmExternalKind>(consume_u8("export kind"));
+      exp->kind = static_cast<ImportExportKindCode>(consume_u8("export kind"));
       switch (exp->kind) {
         case kExternalFunction: {
           WasmFunction* func = nullptr;
@@ -784,12 +797,12 @@ class ModuleDecoderImpl : public Decoder {
       // Decode function names, ignore the rest.
       // Local names will be decoded when needed.
       switch (name_type) {
-        case NameSectionType::kModule: {
+        case NameSectionKindCode::kModule: {
           WireBytesRef name = wasm::consume_string(inner, false, "module name");
           if (inner.ok() && validate_utf8(&inner, name)) module_->name = name;
           break;
         }
-        case NameSectionType::kFunction: {
+        case NameSectionKindCode::kFunction: {
           uint32_t functions_count = inner.consume_u32v("functions count");
 
           for (; inner.ok() && functions_count > 0; --functions_count) {
@@ -836,7 +849,6 @@ class ModuleDecoderImpl : public Decoder {
       // Copy error code and location.
       result.MoveErrorFrom(intermediate_result_);
     }
-    if (FLAG_dump_wasm_module) DumpModule(result);
     return result;
   }
 
@@ -844,6 +856,7 @@ class ModuleDecoderImpl : public Decoder {
   ModuleResult DecodeModule(Isolate* isolate, bool verify_functions = true) {
     StartDecoding(isolate);
     uint32_t offset = 0;
+    Vector<const byte> orig_bytes(start(), end() - start());
     DecodeModuleHeader(Vector<const uint8_t>(start(), end() - start()), offset);
     if (failed()) {
       return FinishDecoding(verify_functions);
@@ -865,6 +878,8 @@ class ModuleDecoderImpl : public Decoder {
       offset += section_iter.payload_length();
       section_iter.advance(true);
     }
+
+    if (FLAG_dump_wasm_module) DumpModule(orig_bytes);
 
     if (decoder.failed()) {
       return decoder.toResult<std::unique_ptr<WasmModule>>(nullptr);
@@ -1118,7 +1133,7 @@ class ModuleDecoderImpl : public Decoder {
 
     if (FLAG_experimental_wasm_threads) {
       bool is_memory = (strcmp(name, "memory") == 0);
-      if (flags & 0xfc || (!is_memory && (flags & 0xfe))) {
+      if (flags & 0xFC || (!is_memory && (flags & 0xFE))) {
         errorf(pos - 1, "invalid %s limits flags", name);
       }
       if (flags == 3) {
@@ -1130,7 +1145,7 @@ class ModuleDecoderImpl : public Decoder {
                name);
       }
     } else {
-      if (flags & 0xfe) {
+      if (flags & 0xFE) {
         errorf(pos - 1, "invalid %s limits flags", name);
       }
     }
@@ -1292,7 +1307,7 @@ class ModuleDecoderImpl : public Decoder {
 
  private:
   FunctionSig* consume_sig_internal(Zone* zone, bool has_return_values) {
-    if (has_return_values && !expect_u8("type form", kWasmFunctionTypeForm))
+    if (has_return_values && !expect_u8("type form", kWasmFunctionTypeCode))
       return nullptr;
     // parse parameter types
     uint32_t param_count =
@@ -1586,7 +1601,7 @@ void DecodeLocalNames(const byte* module_start, const byte* module_end,
     uint32_t name_payload_len = decoder.consume_u32v("name payload length");
     if (!decoder.checkAvailable(name_payload_len)) break;
 
-    if (name_type != NameSectionType::kLocal) {
+    if (name_type != NameSectionKindCode::kLocal) {
       decoder.consume_bytes(name_payload_len, "name subsection payload");
       continue;
     }

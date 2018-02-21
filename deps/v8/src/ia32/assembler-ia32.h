@@ -113,6 +113,7 @@ GENERAL_REGISTERS(DEFINE_REGISTER)
 #undef DEFINE_REGISTER
 constexpr Register no_reg = Register::no_reg();
 
+constexpr bool kPadArguments = false;
 constexpr bool kSimpleFPAliasing = true;
 constexpr bool kSimdMaskRegisters = false;
 
@@ -232,30 +233,19 @@ enum RoundingMode {
 
 class Immediate BASE_EMBEDDED {
  public:
-  inline explicit Immediate(int x) {
+  inline explicit Immediate(int x, RelocInfo::Mode rmode = RelocInfo::NONE) {
     value_.immediate = x;
-    rmode_ = RelocInfo::NONE32;
-  }
-  inline explicit Immediate(const ExternalReference& ext) {
-    value_.immediate = reinterpret_cast<int32_t>(ext.address());
-    rmode_ = RelocInfo::EXTERNAL_REFERENCE;
-  }
-  inline explicit Immediate(Handle<HeapObject> handle) {
-    value_.immediate = reinterpret_cast<intptr_t>(handle.address());
-    rmode_ = RelocInfo::EMBEDDED_OBJECT;
-  }
-  inline explicit Immediate(Smi* value) {
-    value_.immediate = reinterpret_cast<intptr_t>(value);
-    rmode_ = RelocInfo::NONE32;
-  }
-  inline explicit Immediate(Address addr) {
-    value_.immediate = reinterpret_cast<int32_t>(addr);
-    rmode_ = RelocInfo::NONE32;
-  }
-  inline explicit Immediate(Address x, RelocInfo::Mode rmode) {
-    value_.immediate = reinterpret_cast<int32_t>(x);
     rmode_ = rmode;
   }
+  inline explicit Immediate(const ExternalReference& ext)
+      : Immediate(ext.address(), RelocInfo::EXTERNAL_REFERENCE) {}
+  inline explicit Immediate(Handle<HeapObject> handle)
+      : Immediate(handle.address(), RelocInfo::EMBEDDED_OBJECT) {}
+  inline explicit Immediate(Smi* value)
+      : Immediate(reinterpret_cast<intptr_t>(value)) {}
+  inline explicit Immediate(Address addr,
+                            RelocInfo::Mode rmode = RelocInfo::NONE)
+      : Immediate(reinterpret_cast<int32_t>(addr), rmode) {}
 
   static Immediate EmbeddedNumber(double number);  // Smi or HeapNumber.
   static Immediate EmbeddedCode(CodeStub* code);
@@ -355,20 +345,15 @@ class Operand BASE_EMBEDDED {
 
   // [base + disp/r]
   explicit Operand(Register base, int32_t disp,
-                   RelocInfo::Mode rmode = RelocInfo::NONE32);
+                   RelocInfo::Mode rmode = RelocInfo::NONE);
 
   // [base + index*scale + disp/r]
-  explicit Operand(Register base,
-                   Register index,
-                   ScaleFactor scale,
-                   int32_t disp,
-                   RelocInfo::Mode rmode = RelocInfo::NONE32);
+  explicit Operand(Register base, Register index, ScaleFactor scale,
+                   int32_t disp, RelocInfo::Mode rmode = RelocInfo::NONE);
 
   // [index*scale + disp/r]
-  explicit Operand(Register index,
-                   ScaleFactor scale,
-                   int32_t disp,
-                   RelocInfo::Mode rmode = RelocInfo::NONE32);
+  explicit Operand(Register index, ScaleFactor scale, int32_t disp,
+                   RelocInfo::Mode rmode = RelocInfo::NONE);
 
   static Operand JumpTable(Register index, ScaleFactor scale, Label* table) {
     return Operand(index, scale, reinterpret_cast<int32_t>(table),
@@ -528,11 +513,7 @@ class Assembler : public AssemblerBase {
   // The isolate argument is unused (and may be nullptr) when skipping flushing.
   inline static Address target_address_at(Address pc, Address constant_pool);
   inline static void set_target_address_at(
-      Isolate* isolate, Address pc, Address constant_pool, Address target,
-      ICacheFlushMode icache_flush_mode = FLUSH_ICACHE_IF_NEEDED);
-  static inline Address target_address_at(Address pc, Code* code);
-  static inline void set_target_address_at(
-      Isolate* isolate, Address pc, Code* code, Address target,
+      Address pc, Address constant_pool, Address target,
       ICacheFlushMode icache_flush_mode = FLUSH_ICACHE_IF_NEEDED);
 
   // Return the code target address at a call site from the return address
@@ -542,12 +523,11 @@ class Assembler : public AssemblerBase {
   // This sets the branch destination (which is in the instruction on x86).
   // This is for calls and branches within generated code.
   inline static void deserialization_set_special_target_at(
-      Isolate* isolate, Address instruction_payload, Code* code,
-      Address target);
+      Address instruction_payload, Code* code, Address target);
 
   // This sets the internal reference at the pc.
   inline static void deserialization_set_target_internal_reference_at(
-      Isolate* isolate, Address pc, Address target,
+      Address pc, Address target,
       RelocInfo::Mode mode = RelocInfo::INTERNAL_REFERENCE);
 
   static constexpr int kSpecialTargetSize = kPointerSize;
@@ -642,6 +622,7 @@ class Assembler : public AssemblerBase {
   void mov(const Operand& dst, const Immediate& x);
   void mov(const Operand& dst, Handle<HeapObject> handle);
   void mov(const Operand& dst, Register src);
+  void mov(const Operand& dst, Address src, RelocInfo::Mode);
 
   void movsx_b(Register dst, Register src) { movsx_b(dst, Operand(src)); }
   void movsx_b(Register dst, const Operand& src);
@@ -682,6 +663,11 @@ class Assembler : public AssemblerBase {
   void cmpxchg(const Operand& dst, Register src);
   void cmpxchg_b(const Operand& dst, Register src);
   void cmpxchg_w(const Operand& dst, Register src);
+
+  // Memory Fence
+  void lfence();
+
+  void pause();
 
   // Arithmetics
   void adc(Register dst, int32_t imm32);
@@ -797,6 +783,7 @@ class Assembler : public AssemblerBase {
   void sub(Register dst, Register src) { sub(dst, Operand(src)); }
   void sub(Register dst, const Operand& src);
   void sub(const Operand& dst, Register src);
+  void sub_sp_32(uint32_t imm);
 
   void test(Register reg, const Immediate& imm);
   void test(Register reg0, Register reg1) { test(reg0, Operand(reg1)); }
@@ -1004,6 +991,8 @@ class Assembler : public AssemblerBase {
   void rcpps(XMMRegister dst, XMMRegister src) { rcpps(dst, Operand(src)); }
   void rsqrtps(XMMRegister dst, const Operand& src);
   void rsqrtps(XMMRegister dst, XMMRegister src) { rsqrtps(dst, Operand(src)); }
+  void haddps(XMMRegister dst, const Operand& src);
+  void haddps(XMMRegister dst, XMMRegister src) { haddps(dst, Operand(src)); }
 
   void minps(XMMRegister dst, const Operand& src);
   void minps(XMMRegister dst, XMMRegister src) { minps(dst, Operand(src)); }
@@ -1149,6 +1138,10 @@ class Assembler : public AssemblerBase {
   }
   void pextrd(const Operand& dst, XMMRegister src, int8_t offset);
 
+  void insertps(XMMRegister dst, XMMRegister src, int8_t offset) {
+    insertps(dst, Operand(src), offset);
+  }
+  void insertps(XMMRegister dst, const Operand& src, int8_t offset);
   void pinsrb(XMMRegister dst, Register src, int8_t offset) {
     pinsrb(dst, Operand(src), offset);
   }
@@ -1397,6 +1390,14 @@ class Assembler : public AssemblerBase {
   void vrsqrtps(XMMRegister dst, const Operand& src) {
     vinstr(0x52, dst, xmm0, src, kNone, k0F, kWIG);
   }
+  void vmovaps(XMMRegister dst, XMMRegister src) {
+    vps(0x28, dst, xmm0, Operand(src));
+  }
+  void vshufps(XMMRegister dst, XMMRegister src1, XMMRegister src2, byte imm8) {
+    vshufps(dst, src1, Operand(src2), imm8);
+  }
+  void vshufps(XMMRegister dst, XMMRegister src1, const Operand& src2,
+               byte imm8);
 
   void vpsllw(XMMRegister dst, XMMRegister src, int8_t imm8);
   void vpslld(XMMRegister dst, XMMRegister src, int8_t imm8);
@@ -1427,6 +1428,12 @@ class Assembler : public AssemblerBase {
   }
   void vpextrd(const Operand& dst, XMMRegister src, int8_t offset);
 
+  void vinsertps(XMMRegister dst, XMMRegister src1, XMMRegister src2,
+                 int8_t offset) {
+    vinsertps(dst, src1, Operand(src2), offset);
+  }
+  void vinsertps(XMMRegister dst, XMMRegister src1, const Operand& src2,
+                 int8_t offset);
   void vpinsrb(XMMRegister dst, XMMRegister src1, Register src2,
                int8_t offset) {
     vpinsrb(dst, src1, Operand(src2), offset);
@@ -1459,6 +1466,12 @@ class Assembler : public AssemblerBase {
     vinstr(0x5B, dst, xmm0, src, kF3, k0F, kWIG);
   }
 
+  void vmovdqu(XMMRegister dst, const Operand& src) {
+    vinstr(0x6F, dst, xmm0, src, kF3, k0F, kWIG);
+  }
+  void vmovdqu(const Operand& dst, XMMRegister src) {
+    vinstr(0x7F, src, xmm0, dst, kF3, k0F, kWIG);
+  }
   void vmovd(XMMRegister dst, Register src) { vmovd(dst, Operand(src)); }
   void vmovd(XMMRegister dst, const Operand& src) {
     vinstr(0x6E, dst, xmm0, src, k66, k0F, kWIG);

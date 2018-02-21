@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#ifndef V8_INSPECTOR_V8DEBUGGER_H_
-#define V8_INSPECTOR_V8DEBUGGER_H_
+#ifndef V8_INSPECTOR_V8_DEBUGGER_H_
+#define V8_INSPECTOR_V8_DEBUGGER_H_
 
 #include <list>
 #include <unordered_map>
@@ -117,7 +117,9 @@ class V8Debugger : public v8::debug::DebugDelegate {
   void setMaxAsyncTaskStacksForTest(int limit);
   void dumpAsyncTaskStacksStateForTest();
 
-  void* scheduledAsyncTask() { return m_scheduledAsyncTask; }
+  v8_inspector::V8StackTraceId scheduledAsyncCall() {
+    return m_scheduledAsyncCall;
+  }
 
   std::pair<int64_t, int64_t> debuggerIdFor(int contextGroupId);
   std::pair<int64_t, int64_t> debuggerIdFor(
@@ -155,7 +157,7 @@ class V8Debugger : public v8::debug::DebugDelegate {
   void asyncTaskStartedForStack(void* task);
   void asyncTaskFinishedForStack(void* task);
 
-  void asyncTaskCandidateForStepping(void* task);
+  void asyncTaskCandidateForStepping(void* task, bool isLocal);
   void asyncTaskStartedForStepping(void* task);
   void asyncTaskFinishedForStepping(void* task);
   void asyncTaskCanceledForStepping(void* task);
@@ -219,7 +221,7 @@ class V8Debugger : public v8::debug::DebugDelegate {
 
   v8::debug::ExceptionBreakState m_pauseOnExceptionsState;
   bool m_pauseOnAsyncCall = false;
-  void* m_scheduledAsyncTask = nullptr;
+  v8_inspector::V8StackTraceId m_scheduledAsyncCall;
 
   using StackTraceIdToStackTrace =
       protocol::HashMap<uintptr_t, std::weak_ptr<AsyncStackTrace>>;
@@ -238,4 +240,4 @@ class V8Debugger : public v8::debug::DebugDelegate {
 
 }  // namespace v8_inspector
 
-#endif  // V8_INSPECTOR_V8DEBUGGER_H_
+#endif  // V8_INSPECTOR_V8_DEBUGGER_H_

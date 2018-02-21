@@ -5,6 +5,8 @@
 #include "src/compiler/js-call-reducer.h"
 
 #include "src/api.h"
+#include "src/builtins/builtins-promise-gen.h"
+#include "src/builtins/builtins-utils.h"
 #include "src/code-factory.h"
 #include "src/code-stubs.h"
 #include "src/compilation-dependencies.h"
@@ -17,6 +19,7 @@
 #include "src/feedback-vector-inl.h"
 #include "src/ic/call-optimization.h"
 #include "src/objects-inl.h"
+#include "src/vector-slot-pair.h"
 
 namespace v8 {
 namespace internal {
@@ -88,20 +91,6 @@ Reduction JSCallReducer::ReduceBooleanConstructor(Node* node) {
   value = graph()->NewNode(simplified()->ToBoolean(), value);
   ReplaceWithValue(node, value);
   return Replace(value);
-}
-
-// ES6 section 20.1.1 The Number Constructor
-Reduction JSCallReducer::ReduceNumberConstructor(Node* node) {
-  DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
-  CallParameters const& p = CallParametersOf(node->op());
-
-  // Turn the {node} into a {JSToNumber} call.
-  DCHECK_LE(2u, p.arity());
-  Node* value = (p.arity() == 2) ? jsgraph()->ZeroConstant()
-                                 : NodeProperties::GetValueInput(node, 2);
-  NodeProperties::ReplaceValueInputs(node, value);
-  NodeProperties::ChangeOp(node, javascript()->ToNumber());
-  return Changed(node);
 }
 
 // ES section #sec-object-constructor
@@ -350,12 +339,25 @@ Reduction JSCallReducer::ReduceFunctionPrototypeBind(Node* node) {
 Reduction JSCallReducer::ReduceFunctionPrototypeCall(Node* node) {
   DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
   CallParameters const& p = CallParametersOf(node->op());
-  Handle<JSFunction> call = Handle<JSFunction>::cast(
-      HeapObjectMatcher(NodeProperties::GetValueInput(node, 0)).Value());
+  Node* target = NodeProperties::GetValueInput(node, 0);
+  Node* effect = NodeProperties::GetEffectInput(node);
+  Node* control = NodeProperties::GetControlInput(node);
+
   // Change context of {node} to the Function.prototype.call context,
   // to ensure any exception is thrown in the correct context.
-  NodeProperties::ReplaceContextInput(
-      node, jsgraph()->HeapConstant(handle(call->context(), isolate())));
+  Node* context;
+  HeapObjectMatcher m(target);
+  if (m.HasValue()) {
+    Handle<JSFunction> function = Handle<JSFunction>::cast(m.Value());
+    context = jsgraph()->HeapConstant(handle(function->context(), isolate()));
+  } else {
+    context = effect = graph()->NewNode(
+        simplified()->LoadField(AccessBuilder::ForJSFunctionContext()), target,
+        effect, control);
+  }
+  NodeProperties::ReplaceContextInput(node, context);
+  NodeProperties::ReplaceEffectInput(node, effect);
+
   // Remove the target from {node} and use the receiver as target instead, and
   // the thisArg becomes the new target.  If thisArg was not provided, insert
   // undefined instead.
@@ -549,7 +551,7 @@ Reduction JSCallReducer::ReduceObjectPrototypeHasOwnProperty(Node* node) {
           Node* check = graph()->NewNode(simplified()->ReferenceEqual(),
                                          receiver_map, cache_type);
           effect = graph()->NewNode(
-              simplified()->CheckIf(DeoptimizeReason::kNoReason), check, effect,
+              simplified()->CheckIf(DeoptimizeReason::kWrongMap), check, effect,
               control);
         }
         Node* value = jsgraph()->TrueConstant();
@@ -684,14 +686,14 @@ Reduction JSCallReducer::ReduceReflectGet(Node* node) {
   Node* vtrue;
   {
     Callable callable = CodeFactory::GetProperty(isolate());
-    CallDescriptor const* const desc = Linkage::GetStubCallDescriptor(
+    auto call_descriptor = Linkage::GetStubCallDescriptor(
         isolate(), graph()->zone(), callable.descriptor(), 0,
         CallDescriptor::kNeedsFrameState, Operator::kNoProperties,
         MachineType::AnyTagged(), 1);
     Node* stub_code = jsgraph()->HeapConstant(callable.code());
     vtrue = etrue = if_true =
-        graph()->NewNode(common()->Call(desc), stub_code, target, key, context,
-                         frame_state, etrue, if_true);
+        graph()->NewNode(common()->Call(call_descriptor), stub_code, target,
+                         key, context, frame_state, etrue, if_true);
   }
 
   // Rewire potential exception edges.
@@ -804,15 +806,37 @@ bool CanInlineArrayIteratingBuiltin(Handle<Map> receiver_map) {
          isolate->IsAnyInitialArrayPrototype(receiver_prototype);
 }
 
-Reduction JSCallReducer::ReduceArrayForEach(Handle<JSFunction> function,
-                                            Node* node) {
+Node* JSCallReducer::WireInLoopStart(Node* k, Node** control, Node** effect) {
+  Node* loop = *control =
+      graph()->NewNode(common()->Loop(2), *control, *control);
+  Node* eloop = *effect =
+      graph()->NewNode(common()->EffectPhi(2), *effect, *effect, loop);
+  Node* terminate = graph()->NewNode(common()->Terminate(), eloop, loop);
+  NodeProperties::MergeControlToEnd(graph(), common(), terminate);
+  return graph()->NewNode(common()->Phi(MachineRepresentation::kTagged, 2), k,
+                          k, loop);
+}
+
+void JSCallReducer::WireInLoopEnd(Node* loop, Node* eloop, Node* vloop, Node* k,
+                                  Node* control, Node* effect) {
+  loop->ReplaceInput(1, control);
+  vloop->ReplaceInput(1, k);
+  eloop->ReplaceInput(1, effect);
+}
+
+Reduction JSCallReducer::ReduceArrayForEach(Node* node,
+                                            Handle<SharedFunctionInfo> shared) {
   if (!FLAG_turbo_inline_array_builtins) return NoChange();
   DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+  CallParameters const& p = CallParametersOf(node->op());
+  if (p.speculation_mode() == SpeculationMode::kDisallowSpeculation) {
+    return NoChange();
+  }
+
   Node* outer_frame_state = NodeProperties::GetFrameStateInput(node);
   Node* effect = NodeProperties::GetEffectInput(node);
   Node* control = NodeProperties::GetControlInput(node);
   Node* context = NodeProperties::GetContextInput(node);
-  CallParameters const& p = CallParametersOf(node->op());
 
   // Try to determine the {receiver} map.
   Node* receiver = NodeProperties::GetValueInput(node, 1);
@@ -825,28 +849,27 @@ Reduction JSCallReducer::ReduceArrayForEach(Handle<JSFunction> function,
   ZoneHandleSet<Map> receiver_maps;
   NodeProperties::InferReceiverMapsResult result =
       NodeProperties::InferReceiverMaps(receiver, effect, &receiver_maps);
-  if (result != NodeProperties::kReliableReceiverMaps) {
-    return NoChange();
-  }
-  if (receiver_maps.size() == 0) return NoChange();
+  if (result == NodeProperties::kNoReceiverMaps) return NoChange();
 
-  ElementsKind kind = IsDoubleElementsKind(receiver_maps[0]->elements_kind())
-                          ? PACKED_DOUBLE_ELEMENTS
-                          : PACKED_ELEMENTS;
+  // By ensuring that {kind} is object or double, we can be polymorphic
+  // on different elements kinds.
+  ElementsKind kind = receiver_maps[0]->elements_kind();
+  if (IsSmiElementsKind(kind)) {
+    kind = FastSmiToObjectElementsKind(kind);
+  }
   for (Handle<Map> receiver_map : receiver_maps) {
     ElementsKind next_kind = receiver_map->elements_kind();
     if (!CanInlineArrayIteratingBuiltin(receiver_map)) {
       return NoChange();
     }
-    if (!IsFastElementsKind(next_kind) ||
-        (IsDoubleElementsKind(next_kind) && IsHoleyElementsKind(next_kind))) {
+    if (!IsFastElementsKind(next_kind)) {
       return NoChange();
     }
     if (IsDoubleElementsKind(kind) != IsDoubleElementsKind(next_kind)) {
       return NoChange();
     }
     if (IsHoleyElementsKind(next_kind)) {
-      kind = HOLEY_ELEMENTS;
+      kind = GetHoleyElementsKind(kind);
     }
   }
 
@@ -854,11 +877,19 @@ Reduction JSCallReducer::ReduceArrayForEach(Handle<JSFunction> function,
   // global array protector cell.
   dependencies()->AssumePropertyCell(factory()->no_elements_protector());
 
+  // If we have unreliable maps, we need a map check.
+  if (result == NodeProperties::kUnreliableReceiverMaps) {
+    effect =
+        graph()->NewNode(simplified()->CheckMaps(CheckMapsFlag::kNone,
+                                                 receiver_maps, p.feedback()),
+                         receiver, effect, control);
+  }
+
   Node* k = jsgraph()->ZeroConstant();
 
   Node* original_length = effect = graph()->NewNode(
-      simplified()->LoadField(AccessBuilder::ForJSArrayLength(PACKED_ELEMENTS)),
-      receiver, effect, control);
+      simplified()->LoadField(AccessBuilder::ForJSArrayLength(kind)), receiver,
+      effect, control);
 
   std::vector<Node*> checkpoint_params(
       {receiver, fncallback, this_arg, k, original_length});
@@ -867,7 +898,7 @@ Reduction JSCallReducer::ReduceArrayForEach(Handle<JSFunction> function,
   // Check whether the given callback function is callable. Note that this has
   // to happen outside the loop to make sure we also throw on empty arrays.
   Node* check_frame_state = CreateJavaScriptBuiltinContinuationFrameState(
-      jsgraph(), function, Builtins::kArrayForEachLoopLazyDeoptContinuation,
+      jsgraph(), shared, Builtins::kArrayForEachLoopLazyDeoptContinuation,
       node->InputAt(0), context, &checkpoint_params[0], stack_parameters,
       outer_frame_state, ContinuationFrameStateMode::LAZY);
   Node* check_fail = nullptr;
@@ -876,17 +907,9 @@ Reduction JSCallReducer::ReduceArrayForEach(Handle<JSFunction> function,
                                 &control, &check_fail, &check_throw);
 
   // Start the loop.
-  Node* loop = control = graph()->NewNode(common()->Loop(2), control, control);
-  Node* eloop = effect =
-      graph()->NewNode(common()->EffectPhi(2), effect, effect, loop);
-  Node* terminate = graph()->NewNode(common()->Terminate(), eloop, loop);
-  NodeProperties::MergeControlToEnd(graph(), common(), terminate);
-  Node* vloop = k = graph()->NewNode(
-      common()->Phi(MachineRepresentation::kTagged, 2), k, k, loop);
+  Node* vloop = k = WireInLoopStart(k, &control, &effect);
+  Node *loop = control, *eloop = effect;
   checkpoint_params[3] = k;
-
-  control = loop;
-  effect = eloop;
 
   Node* continue_test =
       graph()->NewNode(simplified()->NumberLessThan(), k, original_length);
@@ -898,7 +921,7 @@ Reduction JSCallReducer::ReduceArrayForEach(Handle<JSFunction> function,
   control = if_true;
 
   Node* frame_state = CreateJavaScriptBuiltinContinuationFrameState(
-      jsgraph(), function, Builtins::kArrayForEachLoopEagerDeoptContinuation,
+      jsgraph(), shared, Builtins::kArrayForEachLoopEagerDeoptContinuation,
       node->InputAt(0), context, &checkpoint_params[0], stack_parameters,
       outer_frame_state, ContinuationFrameStateMode::EAGER);
 
@@ -906,14 +929,16 @@ Reduction JSCallReducer::ReduceArrayForEach(Handle<JSFunction> function,
       graph()->NewNode(common()->Checkpoint(), frame_state, effect, control);
 
   // Make sure the map hasn't changed during the iteration
-  effect = graph()->NewNode(
-      simplified()->CheckMaps(CheckMapsFlag::kNone, receiver_maps), receiver,
-      effect, control);
+  effect =
+      graph()->NewNode(simplified()->CheckMaps(CheckMapsFlag::kNone,
+                                               receiver_maps, p.feedback()),
+                       receiver, effect, control);
 
-  Node* element = SafeLoadElement(kind, receiver, control, &effect, &k);
+  Node* element =
+      SafeLoadElement(kind, receiver, control, &effect, &k, p.feedback());
 
   Node* next_k =
-      graph()->NewNode(simplified()->NumberAdd(), k, jsgraph()->Constant(1));
+      graph()->NewNode(simplified()->NumberAdd(), k, jsgraph()->OneConstant());
   checkpoint_params[3] = next_k;
 
   Node* hole_true = nullptr;
@@ -923,8 +948,13 @@ Reduction JSCallReducer::ReduceArrayForEach(Handle<JSFunction> function,
   if (IsHoleyElementsKind(kind)) {
     // Holey elements kind require a hole check and skipping of the element in
     // the case of a hole.
-    Node* check = graph()->NewNode(simplified()->ReferenceEqual(), element,
-                                   jsgraph()->TheHoleConstant());
+    Node* check;
+    if (IsDoubleElementsKind(kind)) {
+      check = graph()->NewNode(simplified()->NumberIsFloat64Hole(), element);
+    } else {
+      check = graph()->NewNode(simplified()->ReferenceEqual(), element,
+                               jsgraph()->TheHoleConstant());
+    }
     Node* branch =
         graph()->NewNode(common()->Branch(BranchHint::kFalse), check, control);
     hole_true = graph()->NewNode(common()->IfTrue(), branch);
@@ -934,12 +964,12 @@ Reduction JSCallReducer::ReduceArrayForEach(Handle<JSFunction> function,
     // The contract is that we don't leak "the hole" into "user JavaScript",
     // so we must rename the {element} here to explicitly exclude "the hole"
     // from the type of {element}.
-    element = graph()->NewNode(common()->TypeGuard(Type::NonInternal()),
-                               element, control);
+    element = effect = graph()->NewNode(
+        common()->TypeGuard(Type::NonInternal()), element, effect, control);
   }
 
   frame_state = CreateJavaScriptBuiltinContinuationFrameState(
-      jsgraph(), function, Builtins::kArrayForEachLoopLazyDeoptContinuation,
+      jsgraph(), shared, Builtins::kArrayForEachLoopLazyDeoptContinuation,
       node->InputAt(0), context, &checkpoint_params[0], stack_parameters,
       outer_frame_state, ContinuationFrameStateMode::LAZY);
 
@@ -965,11 +995,7 @@ Reduction JSCallReducer::ReduceArrayForEach(Handle<JSFunction> function,
                               control);
   }
 
-  k = next_k;
-
-  loop->ReplaceInput(1, control);
-  vloop->ReplaceInput(1, k);
-  eloop->ReplaceInput(1, effect);
+  WireInLoopEnd(loop, eloop, vloop, next_k, control, effect);
 
   control = if_false;
   effect = eloop;
@@ -986,15 +1012,293 @@ Reduction JSCallReducer::ReduceArrayForEach(Handle<JSFunction> function,
   return Replace(jsgraph()->UndefinedConstant());
 }
 
-Reduction JSCallReducer::ReduceArrayMap(Handle<JSFunction> function,
-                                        Node* node) {
+Reduction JSCallReducer::ReduceArrayReduce(Node* node,
+                                           ArrayReduceDirection direction,
+                                           Handle<SharedFunctionInfo> shared) {
   if (!FLAG_turbo_inline_array_builtins) return NoChange();
   DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+  CallParameters const& p = CallParametersOf(node->op());
+  if (p.speculation_mode() == SpeculationMode::kDisallowSpeculation) {
+    return NoChange();
+  }
+  bool left = direction == ArrayReduceDirection::kLeft;
+
   Node* outer_frame_state = NodeProperties::GetFrameStateInput(node);
   Node* effect = NodeProperties::GetEffectInput(node);
   Node* control = NodeProperties::GetControlInput(node);
   Node* context = NodeProperties::GetContextInput(node);
+
+  // Try to determine the {receiver} map.
+  Node* receiver = NodeProperties::GetValueInput(node, 1);
+  Node* fncallback = node->op()->ValueInputCount() > 2
+                         ? NodeProperties::GetValueInput(node, 2)
+                         : jsgraph()->UndefinedConstant();
+
+  ZoneHandleSet<Map> receiver_maps;
+  NodeProperties::InferReceiverMapsResult result =
+      NodeProperties::InferReceiverMaps(receiver, effect, &receiver_maps);
+  if (result == NodeProperties::kNoReceiverMaps) return NoChange();
+
+  ElementsKind kind = receiver_maps[0]->elements_kind();
+  for (Handle<Map> receiver_map : receiver_maps) {
+    if (!CanInlineArrayIteratingBuiltin(receiver_map)) return NoChange();
+    if (!UnionElementsKindUptoSize(&kind, receiver_map->elements_kind()))
+      return NoChange();
+  }
+
+  std::function<Node*(Node*)> hole_check = [this, kind](Node* element) {
+    if (IsDoubleElementsKind(kind)) {
+      return graph()->NewNode(simplified()->NumberIsFloat64Hole(), element);
+    } else {
+      return graph()->NewNode(simplified()->ReferenceEqual(), element,
+                              jsgraph()->TheHoleConstant());
+    }
+  };
+
+  // Install code dependencies on the {receiver} prototype maps and the
+  // global array protector cell.
+  dependencies()->AssumePropertyCell(factory()->no_elements_protector());
+
+  // If we have unreliable maps, we need a map check.
+  if (result == NodeProperties::kUnreliableReceiverMaps) {
+    effect =
+        graph()->NewNode(simplified()->CheckMaps(CheckMapsFlag::kNone,
+                                                 receiver_maps, p.feedback()),
+                         receiver, effect, control);
+  }
+
+  Node* original_length = effect = graph()->NewNode(
+      simplified()->LoadField(AccessBuilder::ForJSArrayLength(PACKED_ELEMENTS)),
+      receiver, effect, control);
+
+  Node* initial_index =
+      left ? jsgraph()->ZeroConstant()
+           : graph()->NewNode(simplified()->NumberSubtract(), original_length,
+                              jsgraph()->OneConstant());
+  const Operator* next_op =
+      left ? simplified()->NumberAdd() : simplified()->NumberSubtract();
+  Node* k = initial_index;
+
+  Node* check_frame_state;
+  {
+    Builtins::Name builtin_lazy =
+        left ? Builtins::kArrayReduceLoopLazyDeoptContinuation
+             : Builtins::kArrayReduceRightLoopLazyDeoptContinuation;
+    const std::vector<Node*> checkpoint_params(
+        {receiver, fncallback, k, original_length,
+         jsgraph()->UndefinedConstant()});
+    const int stack_parameters = static_cast<int>(checkpoint_params.size());
+    check_frame_state = CreateJavaScriptBuiltinContinuationFrameState(
+        jsgraph(), shared, builtin_lazy, node->InputAt(0), context,
+        checkpoint_params.data(), stack_parameters - 1, outer_frame_state,
+        ContinuationFrameStateMode::LAZY);
+  }
+  Node* check_fail = nullptr;
+  Node* check_throw = nullptr;
+  // Check whether the given callback function is callable. Note that
+  // this has to happen outside the loop to make sure we also throw on
+  // empty arrays.
+  WireInCallbackIsCallableCheck(fncallback, context, check_frame_state, effect,
+                                &control, &check_fail, &check_throw);
+
+  // Set initial accumulator value
+  Node* cur = jsgraph()->TheHoleConstant();
+
+  if (node->op()->ValueInputCount() > 3) {
+    cur = NodeProperties::GetValueInput(node, 3);
+  } else {
+    // Find first/last non holey element. In case the search fails, we need a
+    // deopt continuation.
+    Builtins::Name builtin_eager =
+        left ? Builtins::kArrayReducePreLoopEagerDeoptContinuation
+             : Builtins::kArrayReduceRightPreLoopEagerDeoptContinuation;
+    const std::vector<Node*> checkpoint_params(
+        {receiver, fncallback, original_length});
+    const int stack_parameters = static_cast<int>(checkpoint_params.size());
+    Node* find_first_element_frame_state =
+        CreateJavaScriptBuiltinContinuationFrameState(
+            jsgraph(), shared, builtin_eager, node->InputAt(0), context,
+            checkpoint_params.data(), stack_parameters, outer_frame_state,
+            ContinuationFrameStateMode::EAGER);
+
+    Node* vloop = k = WireInLoopStart(k, &control, &effect);
+    Node* loop = control;
+    Node* eloop = effect;
+    effect = graph()->NewNode(common()->Checkpoint(),
+                              find_first_element_frame_state, effect, control);
+    Node* continue_test =
+        left ? graph()->NewNode(simplified()->NumberLessThan(), k,
+                                original_length)
+             : graph()->NewNode(simplified()->NumberLessThanOrEqual(),
+                                jsgraph()->ZeroConstant(), k);
+    effect = graph()->NewNode(
+        simplified()->CheckIf(DeoptimizeReason::kNoInitialElement),
+        continue_test, effect, control);
+
+    cur = SafeLoadElement(kind, receiver, control, &effect, &k, p.feedback());
+    Node* next_k = graph()->NewNode(next_op, k, jsgraph()->OneConstant());
+
+    Node* hole_branch = graph()->NewNode(common()->Branch(BranchHint::kTrue),
+                                         hole_check(cur), control);
+    Node* found_el = graph()->NewNode(common()->IfFalse(), hole_branch);
+    control = found_el;
+    Node* is_hole = graph()->NewNode(common()->IfTrue(), hole_branch);
+
+    WireInLoopEnd(loop, eloop, vloop, next_k, is_hole, effect);
+    // We did the hole-check, so exclude hole from the type.
+    cur = effect = graph()->NewNode(common()->TypeGuard(Type::NonInternal()),
+                                    cur, effect, control);
+    k = next_k;
+  }
+
+  // Start the loop.
+  Node* loop = control = graph()->NewNode(common()->Loop(2), control, control);
+  Node* eloop = effect =
+      graph()->NewNode(common()->EffectPhi(2), effect, effect, loop);
+  Node* terminate = graph()->NewNode(common()->Terminate(), eloop, loop);
+  NodeProperties::MergeControlToEnd(graph(), common(), terminate);
+  Node* kloop = k = graph()->NewNode(
+      common()->Phi(MachineRepresentation::kTagged, 2), k, k, loop);
+  Node* curloop = cur = graph()->NewNode(
+      common()->Phi(MachineRepresentation::kTagged, 2), cur, cur, loop);
+
+  control = loop;
+  effect = eloop;
+
+  Node* continue_test =
+      left
+          ? graph()->NewNode(simplified()->NumberLessThan(), k, original_length)
+          : graph()->NewNode(simplified()->NumberLessThanOrEqual(),
+                             jsgraph()->ZeroConstant(), k);
+
+  Node* continue_branch = graph()->NewNode(common()->Branch(BranchHint::kTrue),
+                                           continue_test, control);
+
+  Node* if_true = graph()->NewNode(common()->IfTrue(), continue_branch);
+  Node* if_false = graph()->NewNode(common()->IfFalse(), continue_branch);
+  control = if_true;
+
+  {
+    Builtins::Name builtin_eager =
+        left ? Builtins::kArrayReduceLoopEagerDeoptContinuation
+             : Builtins::kArrayReduceRightLoopEagerDeoptContinuation;
+    const std::vector<Node*> checkpoint_params(
+        {receiver, fncallback, k, original_length, curloop});
+    const int stack_parameters = static_cast<int>(checkpoint_params.size());
+    Node* frame_state = CreateJavaScriptBuiltinContinuationFrameState(
+        jsgraph(), shared, builtin_eager, node->InputAt(0), context,
+        checkpoint_params.data(), stack_parameters, outer_frame_state,
+        ContinuationFrameStateMode::EAGER);
+    effect =
+        graph()->NewNode(common()->Checkpoint(), frame_state, effect, control);
+  }
+
+  // Make sure the map hasn't changed during the iteration
+  effect = graph()->NewNode(
+      simplified()->CheckMaps(CheckMapsFlag::kNone, receiver_maps), receiver,
+      effect, control);
+
+  Node* element =
+      SafeLoadElement(kind, receiver, control, &effect, &k, p.feedback());
+
+  Node* next_k = graph()->NewNode(next_op, k, jsgraph()->OneConstant());
+
+  Node* hole_true = nullptr;
+  Node* hole_false = nullptr;
+  Node* effect_true = effect;
+
+  if (IsHoleyElementsKind(kind)) {
+    // Holey elements kind require a hole check and skipping of the element in
+    // the case of a hole.
+    Node* branch = graph()->NewNode(common()->Branch(BranchHint::kFalse),
+                                    hole_check(element), control);
+    hole_true = graph()->NewNode(common()->IfTrue(), branch);
+    hole_false = graph()->NewNode(common()->IfFalse(), branch);
+    control = hole_false;
+
+    // The contract is that we don't leak "the hole" into "user JavaScript",
+    // so we must rename the {element} here to explicitly exclude "the hole"
+    // from the type of {element}.
+    element = effect = graph()->NewNode(
+        common()->TypeGuard(Type::NonInternal()), element, effect, control);
+  }
+
+  Node* next_cur;
+  {
+    Builtins::Name builtin_lazy =
+        left ? Builtins::kArrayReduceLoopLazyDeoptContinuation
+             : Builtins::kArrayReduceRightLoopLazyDeoptContinuation;
+    const std::vector<Node*> checkpoint_params(
+        {receiver, fncallback, next_k, original_length, curloop});
+    const int stack_parameters = static_cast<int>(checkpoint_params.size());
+    Node* frame_state = CreateJavaScriptBuiltinContinuationFrameState(
+        jsgraph(), shared, builtin_lazy, node->InputAt(0), context,
+        checkpoint_params.data(), stack_parameters - 1, outer_frame_state,
+        ContinuationFrameStateMode::LAZY);
+
+    next_cur = control = effect =
+        graph()->NewNode(javascript()->Call(6, p.frequency()), fncallback,
+                         jsgraph()->UndefinedConstant(), cur, element, k,
+                         receiver, context, frame_state, effect, control);
+  }
+
+  // Rewire potential exception edges.
+  Node* on_exception = nullptr;
+  if (NodeProperties::IsExceptionalCall(node, &on_exception)) {
+    RewirePostCallbackExceptionEdges(check_throw, on_exception, effect,
+                                     &check_fail, &control);
+  }
+
+  if (IsHoleyElementsKind(kind)) {
+    Node* after_call_control = control;
+    Node* after_call_effect = effect;
+    control = hole_true;
+    effect = effect_true;
+
+    control = graph()->NewNode(common()->Merge(2), control, after_call_control);
+    effect = graph()->NewNode(common()->EffectPhi(2), effect, after_call_effect,
+                              control);
+    next_cur =
+        graph()->NewNode(common()->Phi(MachineRepresentation::kTagged, 2), cur,
+                         next_cur, control);
+  }
+
+  k = next_k;
+  cur = next_cur;
+
+  loop->ReplaceInput(1, control);
+  kloop->ReplaceInput(1, k);
+  curloop->ReplaceInput(1, cur);
+  eloop->ReplaceInput(1, effect);
+
+  control = if_false;
+  effect = eloop;
+
+  // Wire up the branch for the case when IsCallable fails for the callback.
+  // Since {check_throw} is an unconditional throw, it's impossible to
+  // return a successful completion. Therefore, we simply connect the successful
+  // completion to the graph end.
+  Node* throw_node =
+      graph()->NewNode(common()->Throw(), check_throw, check_fail);
+  NodeProperties::MergeControlToEnd(graph(), common(), throw_node);
+
+  ReplaceWithValue(node, curloop, effect, control);
+  return Replace(curloop);
+}
+
+Reduction JSCallReducer::ReduceArrayMap(Node* node,
+                                        Handle<SharedFunctionInfo> shared) {
+  if (!FLAG_turbo_inline_array_builtins) return NoChange();
+  DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
   CallParameters const& p = CallParametersOf(node->op());
+  if (p.speculation_mode() == SpeculationMode::kDisallowSpeculation) {
+    return NoChange();
+  }
+
+  Node* outer_frame_state = NodeProperties::GetFrameStateInput(node);
+  Node* effect = NodeProperties::GetEffectInput(node);
+  Node* control = NodeProperties::GetControlInput(node);
+  Node* context = NodeProperties::GetContextInput(node);
 
   // Try to determine the {receiver} map.
   Node* receiver = NodeProperties::GetValueInput(node, 1);
@@ -1007,31 +1311,18 @@ Reduction JSCallReducer::ReduceArrayMap(Handle<JSFunction> function,
   ZoneHandleSet<Map> receiver_maps;
   NodeProperties::InferReceiverMapsResult result =
       NodeProperties::InferReceiverMaps(receiver, effect, &receiver_maps);
-  if (result != NodeProperties::kReliableReceiverMaps) {
-    return NoChange();
-  }
+  if (result == NodeProperties::kNoReceiverMaps) return NoChange();
 
   // Ensure that any changes to the Array species constructor cause deopt.
-  if (!isolate()->IsArraySpeciesLookupChainIntact()) return NoChange();
-
-  if (receiver_maps.size() == 0) return NoChange();
+  if (!isolate()->IsSpeciesLookupChainIntact()) return NoChange();
 
   const ElementsKind kind = receiver_maps[0]->elements_kind();
 
-  // TODO(danno): Handle holey elements kinds.
-  if (!IsFastPackedElementsKind(kind)) {
-    return NoChange();
-  }
-
   for (Handle<Map> receiver_map : receiver_maps) {
-    if (!CanInlineArrayIteratingBuiltin(receiver_map)) {
-      return NoChange();
-    }
+    if (!CanInlineArrayIteratingBuiltin(receiver_map)) return NoChange();
     // We can handle different maps, as long as their elements kind are the
     // same.
-    if (receiver_map->elements_kind() != kind) {
-      return NoChange();
-    }
+    if (receiver_map->elements_kind() != kind) return NoChange();
   }
 
   dependencies()->AssumePropertyCell(factory()->species_protector());
@@ -1045,10 +1336,13 @@ Reduction JSCallReducer::ReduceArrayMap(Handle<JSFunction> function,
 
   Node* k = jsgraph()->ZeroConstant();
 
-  // Make sure the map hasn't changed before we construct the output array.
-  effect = graph()->NewNode(
-      simplified()->CheckMaps(CheckMapsFlag::kNone, receiver_maps), receiver,
-      effect, control);
+  // If we have unreliable maps, we need a map check.
+  if (result == NodeProperties::kUnreliableReceiverMaps) {
+    effect =
+        graph()->NewNode(simplified()->CheckMaps(CheckMapsFlag::kNone,
+                                                 receiver_maps, p.feedback()),
+                         receiver, effect, control);
+  }
 
   Node* original_length = effect = graph()->NewNode(
       simplified()->LoadField(AccessBuilder::ForJSArrayLength(kind)), receiver,
@@ -1069,7 +1363,7 @@ Reduction JSCallReducer::ReduceArrayMap(Handle<JSFunction> function,
   // Check whether the given callback function is callable. Note that this has
   // to happen outside the loop to make sure we also throw on empty arrays.
   Node* check_frame_state = CreateJavaScriptBuiltinContinuationFrameState(
-      jsgraph(), function, Builtins::kArrayMapLoopLazyDeoptContinuation,
+      jsgraph(), shared, Builtins::kArrayMapLoopLazyDeoptContinuation,
       node->InputAt(0), context, &checkpoint_params[0], stack_parameters,
       outer_frame_state, ContinuationFrameStateMode::LAZY);
   Node* check_fail = nullptr;
@@ -1078,17 +1372,9 @@ Reduction JSCallReducer::ReduceArrayMap(Handle<JSFunction> function,
                                 &control, &check_fail, &check_throw);
 
   // Start the loop.
-  Node* loop = control = graph()->NewNode(common()->Loop(2), control, control);
-  Node* eloop = effect =
-      graph()->NewNode(common()->EffectPhi(2), effect, effect, loop);
-  Node* terminate = graph()->NewNode(common()->Terminate(), eloop, loop);
-  NodeProperties::MergeControlToEnd(graph(), common(), terminate);
-  Node* vloop = k = graph()->NewNode(
-      common()->Phi(MachineRepresentation::kTagged, 2), k, k, loop);
+  Node* vloop = k = WireInLoopStart(k, &control, &effect);
+  Node *loop = control, *eloop = effect;
   checkpoint_params[4] = k;
-
-  control = loop;
-  effect = eloop;
 
   Node* continue_test =
       graph()->NewNode(simplified()->NumberLessThan(), k, original_length);
@@ -1100,7 +1386,7 @@ Reduction JSCallReducer::ReduceArrayMap(Handle<JSFunction> function,
   control = if_true;
 
   Node* frame_state = CreateJavaScriptBuiltinContinuationFrameState(
-      jsgraph(), function, Builtins::kArrayMapLoopEagerDeoptContinuation,
+      jsgraph(), shared, Builtins::kArrayMapLoopEagerDeoptContinuation,
       node->InputAt(0), context, &checkpoint_params[0], stack_parameters,
       outer_frame_state, ContinuationFrameStateMode::EAGER);
 
@@ -1108,19 +1394,48 @@ Reduction JSCallReducer::ReduceArrayMap(Handle<JSFunction> function,
       graph()->NewNode(common()->Checkpoint(), frame_state, effect, control);
 
   // Make sure the map hasn't changed during the iteration
-  effect = graph()->NewNode(
-      simplified()->CheckMaps(CheckMapsFlag::kNone, receiver_maps), receiver,
-      effect, control);
+  effect =
+      graph()->NewNode(simplified()->CheckMaps(CheckMapsFlag::kNone,
+                                               receiver_maps, p.feedback()),
+                       receiver, effect, control);
 
-  Node* element = SafeLoadElement(kind, receiver, control, &effect, &k);
+  Node* element =
+      SafeLoadElement(kind, receiver, control, &effect, &k, p.feedback());
 
   Node* next_k =
       graph()->NewNode(simplified()->NumberAdd(), k, jsgraph()->OneConstant());
 
+  Node* hole_true = nullptr;
+  Node* hole_false = nullptr;
+  Node* effect_true = effect;
+
+  if (IsHoleyElementsKind(kind)) {
+    // Holey elements kind require a hole check and skipping of the element in
+    // the case of a hole.
+    Node* check;
+    if (IsDoubleElementsKind(kind)) {
+      check = graph()->NewNode(simplified()->NumberIsFloat64Hole(), element);
+    } else {
+      check = graph()->NewNode(simplified()->ReferenceEqual(), element,
+                               jsgraph()->TheHoleConstant());
+    }
+    Node* branch =
+        graph()->NewNode(common()->Branch(BranchHint::kFalse), check, control);
+    hole_true = graph()->NewNode(common()->IfTrue(), branch);
+    hole_false = graph()->NewNode(common()->IfFalse(), branch);
+    control = hole_false;
+
+    // The contract is that we don't leak "the hole" into "user JavaScript",
+    // so we must rename the {element} here to explicitly exclude "the hole"
+    // from the type of {element}.
+    element = effect = graph()->NewNode(
+        common()->TypeGuard(Type::NonInternal()), element, effect, control);
+  }
+
   // This frame state is dealt with by hand in
   // ArrayMapLoopLazyDeoptContinuation.
   frame_state = CreateJavaScriptBuiltinContinuationFrameState(
-      jsgraph(), function, Builtins::kArrayMapLoopLazyDeoptContinuation,
+      jsgraph(), shared, Builtins::kArrayMapLoopLazyDeoptContinuation,
       node->InputAt(0), context, &checkpoint_params[0], stack_parameters,
       outer_frame_state, ContinuationFrameStateMode::LAZY);
 
@@ -1143,11 +1458,19 @@ Reduction JSCallReducer::ReduceArrayMap(Handle<JSFunction> function,
       simplified()->TransitionAndStoreElement(double_map, fast_map), a, k,
       callback_value, effect, control);
 
-  k = next_k;
+  if (IsHoleyElementsKind(kind)) {
+    Node* after_call_and_store_control = control;
+    Node* after_call_and_store_effect = effect;
+    control = hole_true;
+    effect = effect_true;
 
-  loop->ReplaceInput(1, control);
-  vloop->ReplaceInput(1, k);
-  eloop->ReplaceInput(1, effect);
+    control = graph()->NewNode(common()->Merge(2), control,
+                               after_call_and_store_control);
+    effect = graph()->NewNode(common()->EffectPhi(2), effect,
+                              after_call_and_store_effect, control);
+  }
+
+  WireInLoopEnd(loop, eloop, vloop, next_k, control, effect);
 
   control = if_false;
   effect = eloop;
@@ -1164,15 +1487,19 @@ Reduction JSCallReducer::ReduceArrayMap(Handle<JSFunction> function,
   return Replace(a);
 }
 
-Reduction JSCallReducer::ReduceArrayFilter(Handle<JSFunction> function,
-                                           Node* node) {
+Reduction JSCallReducer::ReduceArrayFilter(Node* node,
+                                           Handle<SharedFunctionInfo> shared) {
   if (!FLAG_turbo_inline_array_builtins) return NoChange();
   DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+  CallParameters const& p = CallParametersOf(node->op());
+  if (p.speculation_mode() == SpeculationMode::kDisallowSpeculation) {
+    return NoChange();
+  }
+
   Node* outer_frame_state = NodeProperties::GetFrameStateInput(node);
   Node* effect = NodeProperties::GetEffectInput(node);
   Node* control = NodeProperties::GetControlInput(node);
   Node* context = NodeProperties::GetContextInput(node);
-  CallParameters const& p = CallParametersOf(node->op());
   // Try to determine the {receiver} map.
   Node* receiver = NodeProperties::GetValueInput(node, 1);
   Node* fncallback = node->op()->ValueInputCount() > 2
@@ -1184,21 +1511,14 @@ Reduction JSCallReducer::ReduceArrayFilter(Handle<JSFunction> function,
   ZoneHandleSet<Map> receiver_maps;
   NodeProperties::InferReceiverMapsResult result =
       NodeProperties::InferReceiverMaps(receiver, effect, &receiver_maps);
-  if (result != NodeProperties::kReliableReceiverMaps) {
-    return NoChange();
-  }
+  if (result == NodeProperties::kNoReceiverMaps) return NoChange();
 
   // And ensure that any changes to the Array species constructor cause deopt.
-  if (!isolate()->IsArraySpeciesLookupChainIntact()) return NoChange();
-
-  if (receiver_maps.size() == 0) return NoChange();
+  if (!isolate()->IsSpeciesLookupChainIntact()) return NoChange();
 
   const ElementsKind kind = receiver_maps[0]->elements_kind();
-
-  // TODO(danno): Handle holey elements kinds.
-  if (!IsFastPackedElementsKind(kind)) {
-    return NoChange();
-  }
+  // The output array is packed (filter doesn't visit holes).
+  const ElementsKind packed_kind = GetPackedElementsKind(kind);
 
   for (Handle<Map> receiver_map : receiver_maps) {
     if (!CanInlineArrayIteratingBuiltin(receiver_map)) {
@@ -1206,23 +1526,24 @@ Reduction JSCallReducer::ReduceArrayFilter(Handle<JSFunction> function,
     }
     // We can handle different maps, as long as their elements kind are the
     // same.
-    if (receiver_map->elements_kind() != kind) {
-      return NoChange();
-    }
+    if (receiver_map->elements_kind() != kind) return NoChange();
   }
 
   dependencies()->AssumePropertyCell(factory()->species_protector());
 
   Handle<Map> initial_map(
-      Map::cast(native_context()->GetInitialJSArrayMap(kind)));
+      Map::cast(native_context()->GetInitialJSArrayMap(packed_kind)));
 
   Node* k = jsgraph()->ZeroConstant();
   Node* to = jsgraph()->ZeroConstant();
 
-  // Make sure the map hasn't changed before we construct the output array.
-  effect = graph()->NewNode(
-      simplified()->CheckMaps(CheckMapsFlag::kNone, receiver_maps), receiver,
-      effect, control);
+  // If we have unreliable maps, we need a map check.
+  if (result == NodeProperties::kUnreliableReceiverMaps) {
+    effect =
+        graph()->NewNode(simplified()->CheckMaps(CheckMapsFlag::kNone,
+                                                 receiver_maps, p.feedback()),
+                         receiver, effect, control);
+  }
 
   Node* a;  // Construct the output array.
   {
@@ -1232,7 +1553,8 @@ Reduction JSCallReducer::ReduceArrayFilter(Handle<JSFunction> function,
     Node* empty_fixed_array = jsgraph()->EmptyFixedArrayConstant();
     ab.Store(AccessBuilder::ForJSObjectPropertiesOrHash(), empty_fixed_array);
     ab.Store(AccessBuilder::ForJSObjectElements(), empty_fixed_array);
-    ab.Store(AccessBuilder::ForJSArrayLength(kind), jsgraph()->ZeroConstant());
+    ab.Store(AccessBuilder::ForJSArrayLength(packed_kind),
+             jsgraph()->ZeroConstant());
     for (int i = 0; i < initial_map->GetInObjectProperties(); ++i) {
       ab.Store(AccessBuilder::ForJSObjectInObjectProperty(initial_map, i),
                jsgraph()->UndefinedConstant());
@@ -1260,7 +1582,7 @@ Reduction JSCallReducer::ReduceArrayFilter(Handle<JSFunction> function,
     const int stack_parameters = static_cast<int>(checkpoint_params.size());
 
     Node* check_frame_state = CreateJavaScriptBuiltinContinuationFrameState(
-        jsgraph(), function, Builtins::kArrayFilterLoopLazyDeoptContinuation,
+        jsgraph(), shared, Builtins::kArrayFilterLoopLazyDeoptContinuation,
         node->InputAt(0), context, &checkpoint_params[0], stack_parameters,
         outer_frame_state, ContinuationFrameStateMode::LAZY);
     WireInCallbackIsCallableCheck(fncallback, context, check_frame_state,
@@ -1268,18 +1590,10 @@ Reduction JSCallReducer::ReduceArrayFilter(Handle<JSFunction> function,
   }
 
   // Start the loop.
-  Node* loop = control = graph()->NewNode(common()->Loop(2), control, control);
-  Node* eloop = effect =
-      graph()->NewNode(common()->EffectPhi(2), effect, effect, loop);
-  Node* terminate = graph()->NewNode(common()->Terminate(), eloop, loop);
-  NodeProperties::MergeControlToEnd(graph(), common(), terminate);
-  Node* vloop = k = graph()->NewNode(
-      common()->Phi(MachineRepresentation::kTagged, 2), k, k, loop);
+  Node* vloop = k = WireInLoopStart(k, &control, &effect);
+  Node *loop = control, *eloop = effect;
   Node* v_to_loop = to = graph()->NewNode(
       common()->Phi(MachineRepresentation::kTaggedSigned, 2), to, to, loop);
-
-  control = loop;
-  effect = eloop;
 
   Node* continue_test =
       graph()->NewNode(simplified()->NumberLessThan(), k, original_length);
@@ -1296,7 +1610,7 @@ Reduction JSCallReducer::ReduceArrayFilter(Handle<JSFunction> function,
     const int stack_parameters = static_cast<int>(checkpoint_params.size());
 
     Node* frame_state = CreateJavaScriptBuiltinContinuationFrameState(
-        jsgraph(), function, Builtins::kArrayFilterLoopEagerDeoptContinuation,
+        jsgraph(), shared, Builtins::kArrayFilterLoopEagerDeoptContinuation,
         node->InputAt(0), context, &checkpoint_params[0], stack_parameters,
         outer_frame_state, ContinuationFrameStateMode::EAGER);
 
@@ -1305,14 +1619,44 @@ Reduction JSCallReducer::ReduceArrayFilter(Handle<JSFunction> function,
   }
 
   // Make sure the map hasn't changed during the iteration.
-  effect = graph()->NewNode(
-      simplified()->CheckMaps(CheckMapsFlag::kNone, receiver_maps), receiver,
-      effect, control);
+  effect =
+      graph()->NewNode(simplified()->CheckMaps(CheckMapsFlag::kNone,
+                                               receiver_maps, p.feedback()),
+                       receiver, effect, control);
 
-  Node* element = SafeLoadElement(kind, receiver, control, &effect, &k);
+  Node* element =
+      SafeLoadElement(kind, receiver, control, &effect, &k, p.feedback());
 
   Node* next_k =
       graph()->NewNode(simplified()->NumberAdd(), k, jsgraph()->OneConstant());
+
+  Node* hole_true = nullptr;
+  Node* hole_false = nullptr;
+  Node* effect_true = effect;
+  Node* hole_true_vto = to;
+
+  if (IsHoleyElementsKind(kind)) {
+    // Holey elements kind require a hole check and skipping of the element in
+    // the case of a hole.
+    Node* check;
+    if (IsDoubleElementsKind(kind)) {
+      check = graph()->NewNode(simplified()->NumberIsFloat64Hole(), element);
+    } else {
+      check = graph()->NewNode(simplified()->ReferenceEqual(), element,
+                               jsgraph()->TheHoleConstant());
+    }
+    Node* branch =
+        graph()->NewNode(common()->Branch(BranchHint::kFalse), check, control);
+    hole_true = graph()->NewNode(common()->IfTrue(), branch);
+    hole_false = graph()->NewNode(common()->IfFalse(), branch);
+    control = hole_false;
+
+    // The contract is that we don't leak "the hole" into "user JavaScript",
+    // so we must rename the {element} here to explicitly exclude "the hole"
+    // from the type of {element}.
+    element = effect = graph()->NewNode(
+        common()->TypeGuard(Type::NonInternal()), element, effect, control);
+  }
 
   Node* callback_value = nullptr;
   {
@@ -1323,7 +1667,7 @@ Reduction JSCallReducer::ReduceArrayFilter(Handle<JSFunction> function,
     const int stack_parameters = static_cast<int>(checkpoint_params.size());
 
     Node* frame_state = CreateJavaScriptBuiltinContinuationFrameState(
-        jsgraph(), function, Builtins::kArrayFilterLoopLazyDeoptContinuation,
+        jsgraph(), shared, Builtins::kArrayFilterLoopLazyDeoptContinuation,
         node->InputAt(0), context, &checkpoint_params[0], stack_parameters,
         outer_frame_state, ContinuationFrameStateMode::LAZY);
 
@@ -1352,7 +1696,7 @@ Reduction JSCallReducer::ReduceArrayFilter(Handle<JSFunction> function,
                                           callback_value});
     const int stack_parameters = static_cast<int>(checkpoint_params.size());
     Node* frame_state = CreateJavaScriptBuiltinContinuationFrameState(
-        jsgraph(), function, Builtins::kArrayFilterLoopLazyDeoptContinuation,
+        jsgraph(), shared, Builtins::kArrayFilterLoopLazyDeoptContinuation,
         node->InputAt(0), context, &checkpoint_params[0], stack_parameters,
         outer_frame_state, ContinuationFrameStateMode::EAGER);
 
@@ -1363,14 +1707,25 @@ Reduction JSCallReducer::ReduceArrayFilter(Handle<JSFunction> function,
   // We have to coerce callback_value to boolean, and only store the element in
   // a if it's true. The checkpoint above protects against the case that
   // growing {a} fails.
-  to = DoFilterPostCallbackWork(kind, &control, &effect, a, to, element,
+  to = DoFilterPostCallbackWork(packed_kind, &control, &effect, a, to, element,
                                 callback_value);
-  k = next_k;
 
-  loop->ReplaceInput(1, control);
-  vloop->ReplaceInput(1, k);
+  if (IsHoleyElementsKind(kind)) {
+    Node* after_call_control = control;
+    Node* after_call_effect = effect;
+    control = hole_true;
+    effect = effect_true;
+
+    control = graph()->NewNode(common()->Merge(2), control, after_call_control);
+    effect = graph()->NewNode(common()->EffectPhi(2), effect, after_call_effect,
+                              control);
+    to =
+        graph()->NewNode(common()->Phi(MachineRepresentation::kTaggedSigned, 2),
+                         hole_true_vto, to, control);
+  }
+
+  WireInLoopEnd(loop, eloop, vloop, next_k, control, effect);
   v_to_loop->ReplaceInput(1, to);
-  eloop->ReplaceInput(1, effect);
 
   control = if_false;
   effect = eloop;
@@ -1385,6 +1740,215 @@ Reduction JSCallReducer::ReduceArrayFilter(Handle<JSFunction> function,
 
   ReplaceWithValue(node, a, effect, control);
   return Replace(a);
+}
+
+Reduction JSCallReducer::ReduceArrayFind(Node* node, ArrayFindVariant variant,
+                                         Handle<SharedFunctionInfo> shared) {
+  if (!FLAG_turbo_inline_array_builtins) return NoChange();
+  DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+  CallParameters const& p = CallParametersOf(node->op());
+  if (p.speculation_mode() == SpeculationMode::kDisallowSpeculation) {
+    return NoChange();
+  }
+
+  Builtins::Name eager_continuation_builtin;
+  Builtins::Name lazy_continuation_builtin;
+  Builtins::Name after_callback_lazy_continuation_builtin;
+  if (variant == ArrayFindVariant::kFind) {
+    eager_continuation_builtin = Builtins::kArrayFindLoopEagerDeoptContinuation;
+    lazy_continuation_builtin = Builtins::kArrayFindLoopLazyDeoptContinuation;
+    after_callback_lazy_continuation_builtin =
+        Builtins::kArrayFindLoopAfterCallbackLazyDeoptContinuation;
+  } else {
+    DCHECK_EQ(ArrayFindVariant::kFindIndex, variant);
+    eager_continuation_builtin =
+        Builtins::kArrayFindIndexLoopEagerDeoptContinuation;
+    lazy_continuation_builtin =
+        Builtins::kArrayFindIndexLoopLazyDeoptContinuation;
+    after_callback_lazy_continuation_builtin =
+        Builtins::kArrayFindIndexLoopAfterCallbackLazyDeoptContinuation;
+  }
+
+  Node* outer_frame_state = NodeProperties::GetFrameStateInput(node);
+  Node* effect = NodeProperties::GetEffectInput(node);
+  Node* control = NodeProperties::GetControlInput(node);
+  Node* context = NodeProperties::GetContextInput(node);
+
+  // Try to determine the {receiver} map.
+  Node* receiver = NodeProperties::GetValueInput(node, 1);
+  Node* fncallback = node->op()->ValueInputCount() > 2
+                         ? NodeProperties::GetValueInput(node, 2)
+                         : jsgraph()->UndefinedConstant();
+  Node* this_arg = node->op()->ValueInputCount() > 3
+                       ? NodeProperties::GetValueInput(node, 3)
+                       : jsgraph()->UndefinedConstant();
+  ZoneHandleSet<Map> receiver_maps;
+  NodeProperties::InferReceiverMapsResult result =
+      NodeProperties::InferReceiverMaps(receiver, effect, &receiver_maps);
+  if (result == NodeProperties::kNoReceiverMaps) return NoChange();
+
+  const ElementsKind kind = receiver_maps[0]->elements_kind();
+
+  // TODO(pwong): Handle holey double elements kinds.
+  if (IsDoubleElementsKind(kind) && IsHoleyElementsKind(kind)) {
+    return NoChange();
+  }
+
+  for (Handle<Map> receiver_map : receiver_maps) {
+    if (!CanInlineArrayIteratingBuiltin(receiver_map)) return NoChange();
+    // We can handle different maps, as long as their elements kind are the
+    // same.
+    if (receiver_map->elements_kind() != kind) return NoChange();
+  }
+
+  // Install code dependencies on the {receiver} prototype maps and the
+  // global array protector cell.
+  dependencies()->AssumePropertyCell(factory()->no_elements_protector());
+
+  // If we have unreliable maps, we need a map check.
+  if (result == NodeProperties::kUnreliableReceiverMaps) {
+    effect =
+        graph()->NewNode(simplified()->CheckMaps(CheckMapsFlag::kNone,
+                                                 receiver_maps, p.feedback()),
+                         receiver, effect, control);
+  }
+
+  Node* k = jsgraph()->ZeroConstant();
+
+  Node* original_length = effect = graph()->NewNode(
+      simplified()->LoadField(AccessBuilder::ForJSArrayLength(kind)), receiver,
+      effect, control);
+
+  std::vector<Node*> checkpoint_params(
+      {receiver, fncallback, this_arg, k, original_length});
+  const int stack_parameters = static_cast<int>(checkpoint_params.size());
+
+  // Check whether the given callback function is callable. Note that this has
+  // to happen outside the loop to make sure we also throw on empty arrays.
+  Node* check_fail = nullptr;
+  Node* check_throw = nullptr;
+  {
+    Node* frame_state = CreateJavaScriptBuiltinContinuationFrameState(
+        jsgraph(), shared, lazy_continuation_builtin, node->InputAt(0), context,
+        &checkpoint_params[0], stack_parameters, outer_frame_state,
+        ContinuationFrameStateMode::LAZY);
+    WireInCallbackIsCallableCheck(fncallback, context, frame_state, effect,
+                                  &control, &check_fail, &check_throw);
+  }
+
+  // Start the loop.
+  Node* vloop = k = WireInLoopStart(k, &control, &effect);
+  Node *loop = control, *eloop = effect;
+  checkpoint_params[3] = k;
+
+  // Check if we've iterated past the last element of the array.
+  Node* if_false = nullptr;
+  {
+    Node* continue_test =
+        graph()->NewNode(simplified()->NumberLessThan(), k, original_length);
+    Node* continue_branch = graph()->NewNode(
+        common()->Branch(BranchHint::kTrue), continue_test, control);
+    control = graph()->NewNode(common()->IfTrue(), continue_branch);
+    if_false = graph()->NewNode(common()->IfFalse(), continue_branch);
+  }
+
+  // Check the map hasn't changed during the iteration.
+  {
+    Node* frame_state = CreateJavaScriptBuiltinContinuationFrameState(
+        jsgraph(), shared, eager_continuation_builtin, node->InputAt(0),
+        context, &checkpoint_params[0], stack_parameters, outer_frame_state,
+        ContinuationFrameStateMode::EAGER);
+
+    effect =
+        graph()->NewNode(common()->Checkpoint(), frame_state, effect, control);
+
+    effect =
+        graph()->NewNode(simplified()->CheckMaps(CheckMapsFlag::kNone,
+                                                 receiver_maps, p.feedback()),
+                         receiver, effect, control);
+  }
+
+  // Load k-th element from receiver.
+  Node* element =
+      SafeLoadElement(kind, receiver, control, &effect, &k, p.feedback());
+
+  // Increment k for the next iteration.
+  Node* next_k = checkpoint_params[3] =
+      graph()->NewNode(simplified()->NumberAdd(), k, jsgraph()->OneConstant());
+
+  // Replace holes with undefined.
+  if (IsHoleyElementsKind(kind)) {
+    element = graph()->NewNode(
+        common()->Select(MachineRepresentation::kTagged, BranchHint::kFalse),
+        graph()->NewNode(simplified()->ReferenceEqual(), element,
+                         jsgraph()->TheHoleConstant()),
+        jsgraph()->UndefinedConstant(), element);
+  }
+
+  Node* if_found_return_value =
+      (variant == ArrayFindVariant::kFind) ? element : k;
+
+  // Call the callback.
+  Node* callback_value = nullptr;
+  {
+    std::vector<Node*> call_checkpoint_params({receiver, fncallback, this_arg,
+                                               next_k, original_length,
+                                               if_found_return_value});
+    const int call_stack_parameters =
+        static_cast<int>(call_checkpoint_params.size());
+
+    Node* frame_state = CreateJavaScriptBuiltinContinuationFrameState(
+        jsgraph(), shared, after_callback_lazy_continuation_builtin,
+        node->InputAt(0), context, &call_checkpoint_params[0],
+        call_stack_parameters, outer_frame_state,
+        ContinuationFrameStateMode::LAZY);
+
+    callback_value = control = effect = graph()->NewNode(
+        javascript()->Call(5, p.frequency()), fncallback, this_arg, element, k,
+        receiver, context, frame_state, effect, control);
+  }
+
+  // Rewire potential exception edges.
+  Node* on_exception = nullptr;
+  if (NodeProperties::IsExceptionalCall(node, &on_exception)) {
+    RewirePostCallbackExceptionEdges(check_throw, on_exception, effect,
+                                     &check_fail, &control);
+  }
+
+  // Check whether the given callback function returned a truthy value.
+  Node* boolean_result =
+      graph()->NewNode(simplified()->ToBoolean(), callback_value);
+  Node* efound_branch = effect;
+  Node* found_branch = graph()->NewNode(common()->Branch(BranchHint::kFalse),
+                                        boolean_result, control);
+  Node* if_found = graph()->NewNode(common()->IfTrue(), found_branch);
+  Node* if_notfound = graph()->NewNode(common()->IfFalse(), found_branch);
+  control = if_notfound;
+
+  // Close the loop.
+  WireInLoopEnd(loop, eloop, vloop, next_k, control, effect);
+
+  control = graph()->NewNode(common()->Merge(2), if_found, if_false);
+  effect =
+      graph()->NewNode(common()->EffectPhi(2), efound_branch, eloop, control);
+
+  Node* if_not_found_value = (variant == ArrayFindVariant::kFind)
+                                 ? jsgraph()->UndefinedConstant()
+                                 : jsgraph()->MinusOneConstant();
+  Node* return_value =
+      graph()->NewNode(common()->Phi(MachineRepresentation::kTagged, 2),
+                       if_found_return_value, if_not_found_value, control);
+
+  // Wire up the branch for the case when IsCallable fails for the callback.
+  // Since {check_throw} is an unconditional throw, it's impossible to
+  // return a successful completion. Therefore, we simply connect the successful
+  // completion to the graph end.
+  Node* throw_node =
+      graph()->NewNode(common()->Throw(), check_throw, check_fail);
+  NodeProperties::MergeControlToEnd(graph(), common(), throw_node);
+
+  ReplaceWithValue(node, return_value, effect, control);
+  return Replace(return_value);
 }
 
 Node* JSCallReducer::DoFilterPostCallbackWork(ElementsKind kind, Node** control,
@@ -1411,8 +1975,8 @@ Node* JSCallReducer::DoFilterPostCallbackWork(ElementsKind kind, Node** control,
 
     // We know that {to} is in Unsigned31 range here, being smaller than
     // {original_length} at all times.
-    Node* checked_to =
-        graph()->NewNode(common()->TypeGuard(Type::Unsigned31()), to, if_true);
+    Node* checked_to = etrue = graph()->NewNode(
+        common()->TypeGuard(Type::Unsigned31()), to, etrue, if_true);
     Node* elements_length = etrue = graph()->NewNode(
         simplified()->LoadField(AccessBuilder::ForFixedArrayLength()), elements,
         etrue, if_true);
@@ -1420,9 +1984,9 @@ Node* JSCallReducer::DoFilterPostCallbackWork(ElementsKind kind, Node** control,
     GrowFastElementsMode mode =
         IsDoubleElementsKind(kind) ? GrowFastElementsMode::kDoubleElements
                                    : GrowFastElementsMode::kSmiOrObjectElements;
-    elements = etrue =
-        graph()->NewNode(simplified()->MaybeGrowFastElements(mode), a, elements,
-                         checked_to, elements_length, etrue, if_true);
+    elements = etrue = graph()->NewNode(
+        simplified()->MaybeGrowFastElements(mode, VectorSlotPair()), a,
+        elements, checked_to, elements_length, etrue, if_true);
 
     // Update the length of {a}.
     Node* new_length_a = graph()->NewNode(simplified()->NumberAdd(), checked_to,
@@ -1489,14 +2053,15 @@ void JSCallReducer::RewirePostCallbackExceptionEdges(Node* check_throw,
 }
 
 Node* JSCallReducer::SafeLoadElement(ElementsKind kind, Node* receiver,
-                                     Node* control, Node** effect, Node** k) {
+                                     Node* control, Node** effect, Node** k,
+                                     const VectorSlotPair& feedback) {
   // Make sure that the access is still in bounds, since the callback could have
   // changed the array's size.
   Node* length = *effect = graph()->NewNode(
       simplified()->LoadField(AccessBuilder::ForJSArrayLength(kind)), receiver,
       *effect, control);
-  *k = *effect = graph()->NewNode(simplified()->CheckBounds(), *k, length,
-                                  *effect, control);
+  *k = *effect = graph()->NewNode(simplified()->CheckBounds(feedback), *k,
+                                  length, *effect, control);
 
   // Reload the elements pointer before calling the callback, since the previous
   // callback might have resized the array causing the elements buffer to be
@@ -1514,19 +2079,469 @@ Node* JSCallReducer::SafeLoadElement(ElementsKind kind, Node* receiver,
   return element;
 }
 
-Reduction JSCallReducer::ReduceCallApiFunction(Node* node,
-                                               Handle<JSFunction> function) {
+Reduction JSCallReducer::ReduceArrayEvery(Node* node,
+                                          Handle<SharedFunctionInfo> shared) {
+  if (!FLAG_turbo_inline_array_builtins) return NoChange();
+  DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+  CallParameters const& p = CallParametersOf(node->op());
+  if (p.speculation_mode() == SpeculationMode::kDisallowSpeculation) {
+    return NoChange();
+  }
+
+  Node* outer_frame_state = NodeProperties::GetFrameStateInput(node);
+  Node* effect = NodeProperties::GetEffectInput(node);
+  Node* control = NodeProperties::GetControlInput(node);
+  Node* context = NodeProperties::GetContextInput(node);
+  // Try to determine the {receiver} map.
+  Node* receiver = NodeProperties::GetValueInput(node, 1);
+  Node* fncallback = node->op()->ValueInputCount() > 2
+                         ? NodeProperties::GetValueInput(node, 2)
+                         : jsgraph()->UndefinedConstant();
+  Node* this_arg = node->op()->ValueInputCount() > 3
+                       ? NodeProperties::GetValueInput(node, 3)
+                       : jsgraph()->UndefinedConstant();
+  ZoneHandleSet<Map> receiver_maps;
+  NodeProperties::InferReceiverMapsResult result =
+      NodeProperties::InferReceiverMaps(receiver, effect, &receiver_maps);
+  if (result == NodeProperties::kNoReceiverMaps) return NoChange();
+
+  // And ensure that any changes to the Array species constructor cause deopt.
+  if (!isolate()->IsSpeciesLookupChainIntact()) return NoChange();
+
+  const ElementsKind kind = receiver_maps[0]->elements_kind();
+
+  for (Handle<Map> receiver_map : receiver_maps) {
+    if (!CanInlineArrayIteratingBuiltin(receiver_map)) return NoChange();
+    // We can handle different maps, as long as their elements kind are the
+    // same.
+    if (receiver_map->elements_kind() != kind) return NoChange();
+  }
+
+  dependencies()->AssumePropertyCell(factory()->species_protector());
+
+  // If we have unreliable maps, we need a map check.
+  if (result == NodeProperties::kUnreliableReceiverMaps) {
+    effect =
+        graph()->NewNode(simplified()->CheckMaps(CheckMapsFlag::kNone,
+                                                 receiver_maps, p.feedback()),
+                         receiver, effect, control);
+  }
+
+  Node* k = jsgraph()->ZeroConstant();
+
+  // Make sure the map hasn't changed before we construct the output array.
+  effect = graph()->NewNode(
+      simplified()->CheckMaps(CheckMapsFlag::kNone, receiver_maps), receiver,
+      effect, control);
+
+  Node* original_length = effect = graph()->NewNode(
+      simplified()->LoadField(AccessBuilder::ForJSArrayLength(kind)), receiver,
+      effect, control);
+
+  // Check whether the given callback function is callable. Note that this has
+  // to happen outside the loop to make sure we also throw on empty arrays.
+  Node* check_fail = nullptr;
+  Node* check_throw = nullptr;
+  {
+    // This frame state doesn't ever call the deopt continuation, it's only
+    // necessary to specifiy a continuation in order to handle the exceptional
+    // case.
+    std::vector<Node*> checkpoint_params(
+        {receiver, fncallback, this_arg, k, original_length});
+    const int stack_parameters = static_cast<int>(checkpoint_params.size());
+
+    Node* check_frame_state = CreateJavaScriptBuiltinContinuationFrameState(
+        jsgraph(), shared, Builtins::kArrayEveryLoopLazyDeoptContinuation,
+        node->InputAt(0), context, &checkpoint_params[0], stack_parameters,
+        outer_frame_state, ContinuationFrameStateMode::LAZY);
+    WireInCallbackIsCallableCheck(fncallback, context, check_frame_state,
+                                  effect, &control, &check_fail, &check_throw);
+  }
+
+  // Start the loop.
+  Node* vloop = k = WireInLoopStart(k, &control, &effect);
+  Node *loop = control, *eloop = effect;
+
+  Node* continue_test =
+      graph()->NewNode(simplified()->NumberLessThan(), k, original_length);
+  Node* continue_branch = graph()->NewNode(common()->Branch(BranchHint::kTrue),
+                                           continue_test, control);
+
+  Node* if_true = graph()->NewNode(common()->IfTrue(), continue_branch);
+  Node* if_false = graph()->NewNode(common()->IfFalse(), continue_branch);
+  control = if_true;
+
+  {
+    std::vector<Node*> checkpoint_params(
+        {receiver, fncallback, this_arg, k, original_length});
+    const int stack_parameters = static_cast<int>(checkpoint_params.size());
+
+    Node* frame_state = CreateJavaScriptBuiltinContinuationFrameState(
+        jsgraph(), shared, Builtins::kArrayEveryLoopEagerDeoptContinuation,
+        node->InputAt(0), context, &checkpoint_params[0], stack_parameters,
+        outer_frame_state, ContinuationFrameStateMode::EAGER);
+
+    effect =
+        graph()->NewNode(common()->Checkpoint(), frame_state, effect, control);
+  }
+
+  // Make sure the map hasn't changed during the iteration.
+  effect =
+      graph()->NewNode(simplified()->CheckMaps(CheckMapsFlag::kNone,
+                                               receiver_maps, p.feedback()),
+                       receiver, effect, control);
+
+  Node* element =
+      SafeLoadElement(kind, receiver, control, &effect, &k, p.feedback());
+
+  Node* next_k =
+      graph()->NewNode(simplified()->NumberAdd(), k, jsgraph()->OneConstant());
+
+  Node* hole_true = nullptr;
+  Node* hole_false = nullptr;
+  Node* effect_true = effect;
+
+  if (IsHoleyElementsKind(kind)) {
+    // Holey elements kind require a hole check and skipping of the element in
+    // the case of a hole.
+    Node* check;
+    if (IsDoubleElementsKind(kind)) {
+      check = graph()->NewNode(simplified()->NumberIsFloat64Hole(), element);
+    } else {
+      check = graph()->NewNode(simplified()->ReferenceEqual(), element,
+                               jsgraph()->TheHoleConstant());
+    }
+    Node* branch =
+        graph()->NewNode(common()->Branch(BranchHint::kFalse), check, control);
+    hole_true = graph()->NewNode(common()->IfTrue(), branch);
+    hole_false = graph()->NewNode(common()->IfFalse(), branch);
+    control = hole_false;
+
+    // The contract is that we don't leak "the hole" into "user JavaScript",
+    // so we must rename the {element} here to explicitly exclude "the hole"
+    // from the type of {element}.
+    element = effect = graph()->NewNode(
+        common()->TypeGuard(Type::NonInternal()), element, effect, control);
+  }
+
+  Node* callback_value = nullptr;
+  {
+    // This frame state is dealt with by hand in
+    // Builtins::kArrayEveryLoopLazyDeoptContinuation.
+    std::vector<Node*> checkpoint_params(
+        {receiver, fncallback, this_arg, k, original_length});
+    const int stack_parameters = static_cast<int>(checkpoint_params.size());
+
+    Node* frame_state = CreateJavaScriptBuiltinContinuationFrameState(
+        jsgraph(), shared, Builtins::kArrayEveryLoopLazyDeoptContinuation,
+        node->InputAt(0), context, &checkpoint_params[0], stack_parameters,
+        outer_frame_state, ContinuationFrameStateMode::LAZY);
+
+    callback_value = control = effect = graph()->NewNode(
+        javascript()->Call(5, p.frequency()), fncallback, this_arg, element, k,
+        receiver, context, frame_state, effect, control);
+  }
+
+  // Rewire potential exception edges.
+  Node* on_exception = nullptr;
+  if (NodeProperties::IsExceptionalCall(node, &on_exception)) {
+    RewirePostCallbackExceptionEdges(check_throw, on_exception, effect,
+                                     &check_fail, &control);
+  }
+
+  // We have to coerce callback_value to boolean.
+  Node* if_false_callback;
+  Node* efalse_callback;
+  {
+    Node* boolean_result =
+        graph()->NewNode(simplified()->ToBoolean(), callback_value);
+    Node* check_boolean_result =
+        graph()->NewNode(simplified()->ReferenceEqual(), boolean_result,
+                         jsgraph()->TrueConstant());
+    Node* boolean_branch = graph()->NewNode(common()->Branch(BranchHint::kTrue),
+                                            check_boolean_result, control);
+    if_false_callback = graph()->NewNode(common()->IfFalse(), boolean_branch);
+    efalse_callback = effect;
+
+    // Nothing to do in the true case.
+    control = graph()->NewNode(common()->IfTrue(), boolean_branch);
+  }
+
+  if (IsHoleyElementsKind(kind)) {
+    Node* after_call_control = control;
+    Node* after_call_effect = effect;
+    control = hole_true;
+    effect = effect_true;
+
+    control = graph()->NewNode(common()->Merge(2), control, after_call_control);
+    effect = graph()->NewNode(common()->EffectPhi(2), effect, after_call_effect,
+                              control);
+  }
+
+  WireInLoopEnd(loop, eloop, vloop, next_k, control, effect);
+
+  control = graph()->NewNode(common()->Merge(2), if_false, if_false_callback);
+  effect =
+      graph()->NewNode(common()->EffectPhi(2), eloop, efalse_callback, control);
+  Node* return_value = graph()->NewNode(
+      common()->Phi(MachineRepresentation::kTagged, 2),
+      jsgraph()->TrueConstant(), jsgraph()->FalseConstant(), control);
+
+  // Wire up the branch for the case when IsCallable fails for the callback.
+  // Since {check_throw} is an unconditional throw, it's impossible to
+  // return a successful completion. Therefore, we simply connect the successful
+  // completion to the graph end.
+  Node* throw_node =
+      graph()->NewNode(common()->Throw(), check_throw, check_fail);
+  NodeProperties::MergeControlToEnd(graph(), common(), throw_node);
+
+  ReplaceWithValue(node, return_value, effect, control);
+  return Replace(return_value);
+}
+
+Reduction JSCallReducer::ReduceArraySome(Node* node,
+                                         Handle<SharedFunctionInfo> shared) {
+  if (!FLAG_turbo_inline_array_builtins) return NoChange();
+  DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+  CallParameters const& p = CallParametersOf(node->op());
+  if (p.speculation_mode() == SpeculationMode::kDisallowSpeculation) {
+    return NoChange();
+  }
+
+  Node* outer_frame_state = NodeProperties::GetFrameStateInput(node);
+  Node* effect = NodeProperties::GetEffectInput(node);
+  Node* control = NodeProperties::GetControlInput(node);
+  Node* context = NodeProperties::GetContextInput(node);
+  // Try to determine the {receiver} map.
+  Node* receiver = NodeProperties::GetValueInput(node, 1);
+  Node* fncallback = node->op()->ValueInputCount() > 2
+                         ? NodeProperties::GetValueInput(node, 2)
+                         : jsgraph()->UndefinedConstant();
+  Node* this_arg = node->op()->ValueInputCount() > 3
+                       ? NodeProperties::GetValueInput(node, 3)
+                       : jsgraph()->UndefinedConstant();
+  ZoneHandleSet<Map> receiver_maps;
+  NodeProperties::InferReceiverMapsResult result =
+      NodeProperties::InferReceiverMaps(receiver, effect, &receiver_maps);
+  if (result == NodeProperties::kNoReceiverMaps) return NoChange();
+
+  // And ensure that any changes to the Array species constructor cause deopt.
+  if (!isolate()->IsSpeciesLookupChainIntact()) return NoChange();
+
+  if (receiver_maps.size() == 0) return NoChange();
+
+  const ElementsKind kind = receiver_maps[0]->elements_kind();
+
+  for (Handle<Map> receiver_map : receiver_maps) {
+    if (!CanInlineArrayIteratingBuiltin(receiver_map)) return NoChange();
+    // We can handle different maps, as long as their elements kind are the
+    // same.
+    if (receiver_map->elements_kind() != kind) return NoChange();
+  }
+
+  dependencies()->AssumePropertyCell(factory()->species_protector());
+
+  Node* k = jsgraph()->ZeroConstant();
+
+  // If we have unreliable maps, we need a map check.
+  if (result == NodeProperties::kUnreliableReceiverMaps) {
+    effect =
+        graph()->NewNode(simplified()->CheckMaps(CheckMapsFlag::kNone,
+                                                 receiver_maps, p.feedback()),
+                         receiver, effect, control);
+  }
+
+  // Make sure the map hasn't changed before we construct the output array.
+  effect = graph()->NewNode(
+      simplified()->CheckMaps(CheckMapsFlag::kNone, receiver_maps), receiver,
+      effect, control);
+
+  Node* original_length = effect = graph()->NewNode(
+      simplified()->LoadField(AccessBuilder::ForJSArrayLength(kind)), receiver,
+      effect, control);
+
+  // Check whether the given callback function is callable. Note that this has
+  // to happen outside the loop to make sure we also throw on empty arrays.
+  Node* check_fail = nullptr;
+  Node* check_throw = nullptr;
+  {
+    // This frame state doesn't ever call the deopt continuation, it's only
+    // necessary to specifiy a continuation in order to handle the exceptional
+    // case.
+    std::vector<Node*> checkpoint_params(
+        {receiver, fncallback, this_arg, k, original_length});
+    const int stack_parameters = static_cast<int>(checkpoint_params.size());
+
+    Node* check_frame_state = CreateJavaScriptBuiltinContinuationFrameState(
+        jsgraph(), shared, Builtins::kArraySomeLoopLazyDeoptContinuation,
+        node->InputAt(0), context, &checkpoint_params[0], stack_parameters,
+        outer_frame_state, ContinuationFrameStateMode::LAZY);
+    WireInCallbackIsCallableCheck(fncallback, context, check_frame_state,
+                                  effect, &control, &check_fail, &check_throw);
+  }
+
+  // Start the loop.
+  Node* loop = control = graph()->NewNode(common()->Loop(2), control, control);
+  Node* eloop = effect =
+      graph()->NewNode(common()->EffectPhi(2), effect, effect, loop);
+  Node* terminate = graph()->NewNode(common()->Terminate(), eloop, loop);
+  NodeProperties::MergeControlToEnd(graph(), common(), terminate);
+  Node* vloop = k = graph()->NewNode(
+      common()->Phi(MachineRepresentation::kTagged, 2), k, k, loop);
+
+  Node* continue_test =
+      graph()->NewNode(simplified()->NumberLessThan(), k, original_length);
+  Node* continue_branch = graph()->NewNode(common()->Branch(BranchHint::kTrue),
+                                           continue_test, control);
+
+  Node* if_true = graph()->NewNode(common()->IfTrue(), continue_branch);
+  Node* if_false = graph()->NewNode(common()->IfFalse(), continue_branch);
+  control = if_true;
+
+  {
+    std::vector<Node*> checkpoint_params(
+        {receiver, fncallback, this_arg, k, original_length});
+    const int stack_parameters = static_cast<int>(checkpoint_params.size());
+
+    Node* frame_state = CreateJavaScriptBuiltinContinuationFrameState(
+        jsgraph(), shared, Builtins::kArraySomeLoopEagerDeoptContinuation,
+        node->InputAt(0), context, &checkpoint_params[0], stack_parameters,
+        outer_frame_state, ContinuationFrameStateMode::EAGER);
+
+    effect =
+        graph()->NewNode(common()->Checkpoint(), frame_state, effect, control);
+  }
+
+  // Make sure the map hasn't changed during the iteration.
+  effect =
+      graph()->NewNode(simplified()->CheckMaps(CheckMapsFlag::kNone,
+                                               receiver_maps, p.feedback()),
+                       receiver, effect, control);
+
+  Node* element =
+      SafeLoadElement(kind, receiver, control, &effect, &k, p.feedback());
+
+  Node* next_k =
+      graph()->NewNode(simplified()->NumberAdd(), k, jsgraph()->OneConstant());
+
+  Node* hole_true = nullptr;
+  Node* hole_false = nullptr;
+  Node* effect_true = effect;
+
+  if (IsHoleyElementsKind(kind)) {
+    // Holey elements kind require a hole check and skipping of the element in
+    // the case of a hole.
+    Node* check;
+    if (IsDoubleElementsKind(kind)) {
+      check = graph()->NewNode(simplified()->NumberIsFloat64Hole(), element);
+    } else {
+      check = graph()->NewNode(simplified()->ReferenceEqual(), element,
+                               jsgraph()->TheHoleConstant());
+    }
+    Node* branch =
+        graph()->NewNode(common()->Branch(BranchHint::kFalse), check, control);
+    hole_true = graph()->NewNode(common()->IfTrue(), branch);
+    hole_false = graph()->NewNode(common()->IfFalse(), branch);
+    control = hole_false;
+
+    // The contract is that we don't leak "the hole" into "user JavaScript",
+    // so we must rename the {element} here to explicitly exclude "the hole"
+    // from the type of {element}.
+    element = effect = graph()->NewNode(
+        common()->TypeGuard(Type::NonInternal()), element, effect, control);
+  }
+
+  Node* callback_value = nullptr;
+  {
+    // This frame state is dealt with by hand in
+    // Builtins::kArrayEveryLoopLazyDeoptContinuation.
+    std::vector<Node*> checkpoint_params(
+        {receiver, fncallback, this_arg, k, original_length});
+    const int stack_parameters = static_cast<int>(checkpoint_params.size());
+
+    Node* frame_state = CreateJavaScriptBuiltinContinuationFrameState(
+        jsgraph(), shared, Builtins::kArraySomeLoopLazyDeoptContinuation,
+        node->InputAt(0), context, &checkpoint_params[0], stack_parameters,
+        outer_frame_state, ContinuationFrameStateMode::LAZY);
+
+    callback_value = control = effect = graph()->NewNode(
+        javascript()->Call(5, p.frequency()), fncallback, this_arg, element, k,
+        receiver, context, frame_state, effect, control);
+  }
+
+  // Rewire potential exception edges.
+  Node* on_exception = nullptr;
+  if (NodeProperties::IsExceptionalCall(node, &on_exception)) {
+    RewirePostCallbackExceptionEdges(check_throw, on_exception, effect,
+                                     &check_fail, &control);
+  }
+
+  // We have to coerce callback_value to boolean.
+  Node* if_true_callback;
+  Node* etrue_callback;
+  {
+    Node* boolean_result =
+        graph()->NewNode(simplified()->ToBoolean(), callback_value);
+    Node* check_boolean_result =
+        graph()->NewNode(simplified()->ReferenceEqual(), boolean_result,
+                         jsgraph()->TrueConstant());
+    Node* boolean_branch = graph()->NewNode(
+        common()->Branch(BranchHint::kFalse), check_boolean_result, control);
+    if_true_callback = graph()->NewNode(common()->IfTrue(), boolean_branch);
+    etrue_callback = effect;
+
+    // Nothing to do in the false case.
+    control = graph()->NewNode(common()->IfFalse(), boolean_branch);
+  }
+
+  if (IsHoleyElementsKind(kind)) {
+    Node* after_call_control = control;
+    Node* after_call_effect = effect;
+    control = hole_true;
+    effect = effect_true;
+
+    control = graph()->NewNode(common()->Merge(2), control, after_call_control);
+    effect = graph()->NewNode(common()->EffectPhi(2), effect, after_call_effect,
+                              control);
+  }
+
+  loop->ReplaceInput(1, control);
+  vloop->ReplaceInput(1, next_k);
+  eloop->ReplaceInput(1, effect);
+
+  control = graph()->NewNode(common()->Merge(2), if_false, if_true_callback);
+  effect =
+      graph()->NewNode(common()->EffectPhi(2), eloop, etrue_callback, control);
+  Node* return_value = graph()->NewNode(
+      common()->Phi(MachineRepresentation::kTagged, 2),
+      jsgraph()->FalseConstant(), jsgraph()->TrueConstant(), control);
+
+  // Wire up the branch for the case when IsCallable fails for the callback.
+  // Since {check_throw} is an unconditional throw, it's impossible to
+  // return a successful completion. Therefore, we simply connect the successful
+  // completion to the graph end.
+  Node* throw_node =
+      graph()->NewNode(common()->Throw(), check_throw, check_fail);
+  NodeProperties::MergeControlToEnd(graph(), common(), throw_node);
+
+  ReplaceWithValue(node, return_value, effect, control);
+  return Replace(return_value);
+}
+
+Reduction JSCallReducer::ReduceCallApiFunction(
+    Node* node, Handle<SharedFunctionInfo> shared) {
   DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
   CallParameters const& p = CallParametersOf(node->op());
   int const argc = static_cast<int>(p.arity()) - 2;
+  Node* target = NodeProperties::GetValueInput(node, 0);
   Node* receiver = (p.convert_mode() == ConvertReceiverMode::kNullOrUndefined)
                        ? jsgraph()->HeapConstant(global_proxy())
                        : NodeProperties::GetValueInput(node, 1);
   Node* effect = NodeProperties::GetEffectInput(node);
+  Node* control = NodeProperties::GetControlInput(node);
 
   Handle<FunctionTemplateInfo> function_template_info(
-      FunctionTemplateInfo::cast(function->shared()->function_data()));
-  Handle<Context> context(function->context());
+      FunctionTemplateInfo::cast(shared->function_data()));
 
   // CallApiCallbackStub expects the target in a register, so we count it out,
   // and counts the receiver as an implicit argument, so we count the receiver
@@ -1575,6 +2590,11 @@ Reduction JSCallReducer::ReduceCallApiFunction(Node* node,
     }
   }
 
+  // Load the {target}s context.
+  Node* context = effect = graph()->NewNode(
+      simplified()->LoadField(AccessBuilder::ForJSFunctionContext()), target,
+      effect, control);
+
   // CallApiCallbackStub's register arguments: code, target, call data, holder,
   // function address.
   // TODO(turbofan): Consider introducing a JSCallApiCallback operator for
@@ -1585,7 +2605,7 @@ Reduction JSCallReducer::ReduceCallApiFunction(Node* node,
   Handle<Object> data(call_handler_info->data(), isolate());
   CallApiCallbackStub stub(isolate(), argc);
   CallInterfaceDescriptor cid = stub.GetCallInterfaceDescriptor();
-  CallDescriptor* call_descriptor = Linkage::GetStubCallDescriptor(
+  auto call_descriptor = Linkage::GetStubCallDescriptor(
       isolate(), graph()->zone(), cid,
       cid.GetStackParameterCount() + argc + 1 /* implicit receiver */,
       CallDescriptor::kNeedsFrameState, Operator::kNoProperties,
@@ -1598,14 +2618,14 @@ Reduction JSCallReducer::ReduceCallApiFunction(Node* node,
       &api_function, ExternalReference::DIRECT_API_CALL, isolate());
   node->InsertInput(graph()->zone(), 0,
                     jsgraph()->HeapConstant(stub.GetCode()));
-  node->ReplaceInput(1, jsgraph()->Constant(context));
+  node->ReplaceInput(1, context);
   node->InsertInput(graph()->zone(), 2, jsgraph()->Constant(data));
   node->InsertInput(graph()->zone(), 3, holder);
   node->InsertInput(graph()->zone(), 4,
                     jsgraph()->ExternalConstant(function_reference));
   node->ReplaceInput(5, receiver);
-  // Remove context input.
-  node->RemoveInput(6 + argc);
+  node->RemoveInput(6 + argc);           // Remove context input.
+  node->ReplaceInput(7 + argc, effect);  // Update effect input.
   NodeProperties::ChangeOp(node, common()->Call(call_descriptor));
   return Changed(node);
 }
@@ -1883,73 +2903,11 @@ Reduction JSCallReducer::ReduceJSCall(Node* node) {
   if (m.HasValue()) {
     if (m.Value()->IsJSFunction()) {
       Handle<JSFunction> function = Handle<JSFunction>::cast(m.Value());
-      Handle<SharedFunctionInfo> shared(function->shared(), isolate());
-
-      // Raise a TypeError if the {target} is a "classConstructor".
-      if (IsClassConstructor(shared->kind())) {
-        NodeProperties::ReplaceValueInputs(node, target);
-        NodeProperties::ChangeOp(
-            node, javascript()->CallRuntime(
-                      Runtime::kThrowConstructorNonCallableError, 1));
-        return Changed(node);
-      }
 
       // Don't inline cross native context.
       if (function->native_context() != *native_context()) return NoChange();
 
-      // Check for known builtin functions.
-      switch (shared->code()->builtin_index()) {
-        case Builtins::kArrayConstructor:
-          return ReduceArrayConstructor(node);
-        case Builtins::kBooleanConstructor:
-          return ReduceBooleanConstructor(node);
-        case Builtins::kFunctionPrototypeApply:
-          return ReduceFunctionPrototypeApply(node);
-        case Builtins::kFastFunctionPrototypeBind:
-          return ReduceFunctionPrototypeBind(node);
-        case Builtins::kFunctionPrototypeCall:
-          return ReduceFunctionPrototypeCall(node);
-        case Builtins::kFunctionPrototypeHasInstance:
-          return ReduceFunctionPrototypeHasInstance(node);
-        case Builtins::kNumberConstructor:
-          return ReduceNumberConstructor(node);
-        case Builtins::kObjectConstructor:
-          return ReduceObjectConstructor(node);
-        case Builtins::kObjectGetPrototypeOf:
-          return ReduceObjectGetPrototypeOf(node);
-        case Builtins::kObjectIs:
-          return ReduceObjectIs(node);
-        case Builtins::kObjectPrototypeGetProto:
-          return ReduceObjectPrototypeGetProto(node);
-        case Builtins::kObjectPrototypeHasOwnProperty:
-          return ReduceObjectPrototypeHasOwnProperty(node);
-        case Builtins::kObjectPrototypeIsPrototypeOf:
-          return ReduceObjectPrototypeIsPrototypeOf(node);
-        case Builtins::kReflectApply:
-          return ReduceReflectApply(node);
-        case Builtins::kReflectConstruct:
-          return ReduceReflectConstruct(node);
-        case Builtins::kReflectGet:
-          return ReduceReflectGet(node);
-        case Builtins::kReflectGetPrototypeOf:
-          return ReduceReflectGetPrototypeOf(node);
-        case Builtins::kReflectHas:
-          return ReduceReflectHas(node);
-        case Builtins::kArrayForEach:
-          return ReduceArrayForEach(function, node);
-        case Builtins::kArrayMap:
-          return ReduceArrayMap(function, node);
-        case Builtins::kArrayFilter:
-          return ReduceArrayFilter(function, node);
-        case Builtins::kReturnReceiver:
-          return ReduceReturnReceiver(node);
-        default:
-          break;
-      }
-
-      if (!FLAG_runtime_stats && shared->IsApiFunction()) {
-        return ReduceCallApiFunction(node, function);
-      }
+      return ReduceJSCall(node, handle(function->shared(), isolate()));
     } else if (m.Value()->IsJSBoundFunction()) {
       Handle<JSBoundFunction> function =
           Handle<JSBoundFunction>::cast(m.Value());
@@ -1987,6 +2945,15 @@ Reduction JSCallReducer::ReduceJSCall(Node* node) {
     return NoChange();
   }
 
+  // If {target} is the result of a JSCreateClosure operation, we can
+  // just immediately try to inline based on the SharedFunctionInfo,
+  // since TurboFan generally doesn't inline cross-context, and hence
+  // the {target} must have the same native context as the call site.
+  if (target->opcode() == IrOpcode::kJSCreateClosure) {
+    CreateClosureParameters const& p = CreateClosureParametersOf(target->op());
+    return ReduceJSCall(node, p.shared_info());
+  }
+
   // If {target} is the result of a JSCreateBoundFunction operation,
   // we can just fold the construction and call the bound target
   // function directly instead.
@@ -2021,9 +2988,9 @@ Reduction JSCallReducer::ReduceJSCall(Node* node) {
     return reduction.Changed() ? reduction : Changed(node);
   }
 
-  // Extract feedback from the {node} using the CallICNexus.
+  // Extract feedback from the {node} using the FeedbackNexus.
   if (!p.feedback().IsValid()) return NoChange();
-  CallICNexus nexus(p.feedback().vector(), p.feedback().slot());
+  FeedbackNexus nexus(p.feedback().vector(), p.feedback().slot());
   if (nexus.IsUninitialized()) {
     if (flags() & kBailoutOnUninitialized) {
       // Introduce a SOFT deopt if the call {node} wasn't executed so far.
@@ -2046,9 +3013,9 @@ Reduction JSCallReducer::ReduceJSCall(Node* node) {
       // Check that the {target} is still the {target_function}.
       Node* check = graph()->NewNode(simplified()->ReferenceEqual(), target,
                                      target_function);
-      effect =
-          graph()->NewNode(simplified()->CheckIf(DeoptimizeReason::kNoReason),
-                           check, effect, control);
+      effect = graph()->NewNode(
+          simplified()->CheckIf(DeoptimizeReason::kWrongCallTarget), check,
+          effect, control);
 
       // Specialize the JSCall node to the {target_function}.
       NodeProperties::ReplaceValueInput(node, target_function, 0);
@@ -2058,6 +3025,125 @@ Reduction JSCallReducer::ReduceJSCall(Node* node) {
       Reduction const reduction = ReduceJSCall(node);
       return reduction.Changed() ? reduction : Changed(node);
     }
+  }
+  return NoChange();
+}
+
+Reduction JSCallReducer::ReduceJSCall(Node* node,
+                                      Handle<SharedFunctionInfo> shared) {
+  DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+  Node* target = NodeProperties::GetValueInput(node, 0);
+
+  // Do not reduce calls to functions with break points.
+  if (shared->HasBreakInfo()) return NoChange();
+
+  // Raise a TypeError if the {target} is a "classConstructor".
+  if (IsClassConstructor(shared->kind())) {
+    NodeProperties::ReplaceValueInputs(node, target);
+    NodeProperties::ChangeOp(
+        node, javascript()->CallRuntime(
+                  Runtime::kThrowConstructorNonCallableError, 1));
+    return Changed(node);
+  }
+
+  // Check for known builtin functions.
+  switch (shared->code()->builtin_index()) {
+    case Builtins::kArrayConstructor:
+      return ReduceArrayConstructor(node);
+    case Builtins::kBooleanConstructor:
+      return ReduceBooleanConstructor(node);
+    case Builtins::kFunctionPrototypeApply:
+      return ReduceFunctionPrototypeApply(node);
+    case Builtins::kFastFunctionPrototypeBind:
+      return ReduceFunctionPrototypeBind(node);
+    case Builtins::kFunctionPrototypeCall:
+      return ReduceFunctionPrototypeCall(node);
+    case Builtins::kFunctionPrototypeHasInstance:
+      return ReduceFunctionPrototypeHasInstance(node);
+    case Builtins::kObjectConstructor:
+      return ReduceObjectConstructor(node);
+    case Builtins::kObjectGetPrototypeOf:
+      return ReduceObjectGetPrototypeOf(node);
+    case Builtins::kObjectIs:
+      return ReduceObjectIs(node);
+    case Builtins::kObjectPrototypeGetProto:
+      return ReduceObjectPrototypeGetProto(node);
+    case Builtins::kObjectPrototypeHasOwnProperty:
+      return ReduceObjectPrototypeHasOwnProperty(node);
+    case Builtins::kObjectPrototypeIsPrototypeOf:
+      return ReduceObjectPrototypeIsPrototypeOf(node);
+    case Builtins::kReflectApply:
+      return ReduceReflectApply(node);
+    case Builtins::kReflectConstruct:
+      return ReduceReflectConstruct(node);
+    case Builtins::kReflectGet:
+      return ReduceReflectGet(node);
+    case Builtins::kReflectGetPrototypeOf:
+      return ReduceReflectGetPrototypeOf(node);
+    case Builtins::kReflectHas:
+      return ReduceReflectHas(node);
+    case Builtins::kArrayForEach:
+      return ReduceArrayForEach(node, shared);
+    case Builtins::kArrayMap:
+      return ReduceArrayMap(node, shared);
+    case Builtins::kArrayFilter:
+      return ReduceArrayFilter(node, shared);
+    case Builtins::kArrayReduce:
+      return ReduceArrayReduce(node, ArrayReduceDirection::kLeft, shared);
+    case Builtins::kArrayReduceRight:
+      return ReduceArrayReduce(node, ArrayReduceDirection::kRight, shared);
+    case Builtins::kArrayPrototypeFind:
+      return ReduceArrayFind(node, ArrayFindVariant::kFind, shared);
+    case Builtins::kArrayPrototypeFindIndex:
+      return ReduceArrayFind(node, ArrayFindVariant::kFindIndex, shared);
+    case Builtins::kArrayEvery:
+      return ReduceArrayEvery(node, shared);
+    case Builtins::kArraySome:
+      return ReduceArraySome(node, shared);
+    case Builtins::kArrayPrototypePush:
+      return ReduceArrayPrototypePush(node);
+    case Builtins::kArrayPrototypePop:
+      return ReduceArrayPrototypePop(node);
+    case Builtins::kArrayPrototypeShift:
+      return ReduceArrayPrototypeShift(node);
+    case Builtins::kReturnReceiver:
+      return ReduceReturnReceiver(node);
+    case Builtins::kStringPrototypeIndexOf:
+      return ReduceStringPrototypeIndexOf(node);
+    case Builtins::kStringPrototypeCharAt:
+      return ReduceStringPrototypeStringAt(simplified()->StringCharAt(), node);
+    case Builtins::kStringPrototypeCharCodeAt:
+      return ReduceStringPrototypeStringAt(simplified()->StringCharCodeAt(),
+                                           node);
+    case Builtins::kStringPrototypeCodePointAt:
+      return ReduceStringPrototypeStringAt(
+          simplified()->StringCodePointAt(UnicodeEncoding::UTF32), node);
+    case Builtins::kAsyncFunctionPromiseCreate:
+      return ReduceAsyncFunctionPromiseCreate(node);
+    case Builtins::kAsyncFunctionPromiseRelease:
+      return ReduceAsyncFunctionPromiseRelease(node);
+    case Builtins::kPromiseCapabilityDefaultReject:
+      return ReducePromiseCapabilityDefaultReject(node);
+    case Builtins::kPromiseCapabilityDefaultResolve:
+      return ReducePromiseCapabilityDefaultResolve(node);
+    case Builtins::kPromiseInternalConstructor:
+      return ReducePromiseInternalConstructor(node);
+    case Builtins::kPromiseInternalReject:
+      return ReducePromiseInternalReject(node);
+    case Builtins::kPromiseInternalResolve:
+      return ReducePromiseInternalResolve(node);
+    case Builtins::kPromisePrototypeCatch:
+      return ReducePromisePrototypeCatch(node);
+    case Builtins::kPromisePrototypeFinally:
+      return ReducePromisePrototypeFinally(node);
+    case Builtins::kPromisePrototypeThen:
+      return ReducePromisePrototypeThen(node);
+    default:
+      break;
+  }
+
+  if (!FLAG_runtime_stats && shared->IsApiFunction()) {
+    return ReduceCallApiFunction(node, shared);
   }
   return NoChange();
 }
@@ -2091,9 +3177,9 @@ Reduction JSCallReducer::ReduceJSConstruct(Node* node) {
   Node* effect = NodeProperties::GetEffectInput(node);
   Node* control = NodeProperties::GetControlInput(node);
 
-  // Extract feedback from the {node} using the CallICNexus.
+  // Extract feedback from the {node} using the FeedbackNexus.
   if (p.feedback().IsValid()) {
-    CallICNexus nexus(p.feedback().vector(), p.feedback().slot());
+    FeedbackNexus nexus(p.feedback().vector(), p.feedback().slot());
     if (nexus.IsUninitialized()) {
       if (flags() & kBailoutOnUninitialized) {
         // Introduce a SOFT deopt if the construct {node} wasn't executed so
@@ -2119,9 +3205,9 @@ Reduction JSCallReducer::ReduceJSConstruct(Node* node) {
       // Check that the {target} is still the {array_function}.
       Node* check = graph()->NewNode(simplified()->ReferenceEqual(), target,
                                      array_function);
-      effect =
-          graph()->NewNode(simplified()->CheckIf(DeoptimizeReason::kNoReason),
-                           check, effect, control);
+      effect = graph()->NewNode(
+          simplified()->CheckIf(DeoptimizeReason::kWrongCallTarget), check,
+          effect, control);
 
       // Turn the {node} into a {JSCreateArray} call.
       NodeProperties::ReplaceEffectInput(node, effect);
@@ -2142,9 +3228,9 @@ Reduction JSCallReducer::ReduceJSConstruct(Node* node) {
         // Check that the {new_target} is still the {new_target_feedback}.
         Node* check = graph()->NewNode(simplified()->ReferenceEqual(),
                                        new_target, new_target_feedback);
-        effect =
-            graph()->NewNode(simplified()->CheckIf(DeoptimizeReason::kNoReason),
-                             check, effect, control);
+        effect = graph()->NewNode(
+            simplified()->CheckIf(DeoptimizeReason::kWrongCallTarget), check,
+            effect, control);
 
         // Specialize the JSConstruct node to the {new_target_feedback}.
         NodeProperties::ReplaceValueInput(node, new_target_feedback, arity + 1);
@@ -2211,6 +3297,11 @@ Reduction JSCallReducer::ReduceJSConstruct(Node* node) {
           NodeProperties::ChangeOp(node, javascript()->Create());
           return Changed(node);
         }
+      }
+
+      // Check for the PromiseConstructor
+      if (*function == function->native_context()->promise_function()) {
+        return ReducePromiseConstructor(node);
       }
     } else if (m.Value()->IsJSBoundFunction()) {
       Handle<JSBoundFunction> function =
@@ -2297,6 +3388,46 @@ Reduction JSCallReducer::ReduceJSConstruct(Node* node) {
   return NoChange();
 }
 
+// ES6 String.prototype.indexOf(searchString [, position])
+// #sec-string.prototype.indexof
+Reduction JSCallReducer::ReduceStringPrototypeIndexOf(Node* node) {
+  DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+  CallParameters const& p = CallParametersOf(node->op());
+  if (p.speculation_mode() == SpeculationMode::kDisallowSpeculation) {
+    return NoChange();
+  }
+
+  Node* effect = NodeProperties::GetEffectInput(node);
+  Node* control = NodeProperties::GetControlInput(node);
+  if (node->op()->ValueInputCount() >= 3) {
+    Node* receiver = NodeProperties::GetValueInput(node, 1);
+    Node* new_receiver = effect = graph()->NewNode(
+        simplified()->CheckString(p.feedback()), receiver, effect, control);
+
+    Node* search_string = NodeProperties::GetValueInput(node, 2);
+    Node* new_search_string = effect =
+        graph()->NewNode(simplified()->CheckString(p.feedback()), search_string,
+                         effect, control);
+
+    Node* new_position = jsgraph()->ZeroConstant();
+    if (node->op()->ValueInputCount() >= 4) {
+      Node* position = NodeProperties::GetValueInput(node, 3);
+      new_position = effect = graph()->NewNode(
+          simplified()->CheckSmi(p.feedback()), position, effect, control);
+    }
+
+    NodeProperties::ReplaceEffectInput(node, effect);
+    RelaxEffectsAndControls(node);
+    node->ReplaceInput(0, new_receiver);
+    node->ReplaceInput(1, new_search_string);
+    node->ReplaceInput(2, new_position);
+    node->TrimInputCount(3);
+    NodeProperties::ChangeOp(node, simplified()->StringIndexOf());
+    return Changed(node);
+  }
+  return NoChange();
+}
+
 Reduction JSCallReducer::ReduceJSConstructWithArrayLike(Node* node) {
   DCHECK_EQ(IrOpcode::kJSConstructWithArrayLike, node->opcode());
   CallFrequency frequency = CallFrequencyOf(node->op());
@@ -2328,14 +3459,1181 @@ Reduction JSCallReducer::ReduceSoftDeoptimize(Node* node,
   Node* effect = NodeProperties::GetEffectInput(node);
   Node* control = NodeProperties::GetControlInput(node);
   Node* frame_state = NodeProperties::FindFrameStateBefore(node);
-  Node* deoptimize =
-      graph()->NewNode(common()->Deoptimize(DeoptimizeKind::kSoft, reason),
-                       frame_state, effect, control);
+  Node* deoptimize = graph()->NewNode(
+      common()->Deoptimize(DeoptimizeKind::kSoft, reason, VectorSlotPair()),
+      frame_state, effect, control);
   // TODO(bmeurer): This should be on the AdvancedReducer somehow.
   NodeProperties::MergeControlToEnd(graph(), common(), deoptimize);
   Revisit(graph()->end());
   node->TrimInputCount(0);
   NodeProperties::ChangeOp(node, common()->Dead());
+  return Changed(node);
+}
+
+namespace {
+
+// TODO(turbofan): This was copied from Crankshaft, might be too restrictive.
+bool IsReadOnlyLengthDescriptor(Handle<Map> jsarray_map) {
+  DCHECK(!jsarray_map->is_dictionary_map());
+  Isolate* isolate = jsarray_map->GetIsolate();
+  Handle<Name> length_string = isolate->factory()->length_string();
+  DescriptorArray* descriptors = jsarray_map->instance_descriptors();
+  int number =
+      descriptors->SearchWithCache(isolate, *length_string, *jsarray_map);
+  DCHECK_NE(DescriptorArray::kNotFound, number);
+  return descriptors->GetDetails(number).IsReadOnly();
+}
+
+// TODO(turbofan): This was copied from Crankshaft, might be too restrictive.
+bool CanInlineArrayResizeOperation(Handle<Map> receiver_map) {
+  Isolate* const isolate = receiver_map->GetIsolate();
+  if (!receiver_map->prototype()->IsJSArray()) return false;
+  Handle<JSArray> receiver_prototype(JSArray::cast(receiver_map->prototype()),
+                                     isolate);
+  return receiver_map->instance_type() == JS_ARRAY_TYPE &&
+         IsFastElementsKind(receiver_map->elements_kind()) &&
+         !receiver_map->is_dictionary_map() && receiver_map->is_extensible() &&
+         isolate->IsAnyInitialArrayPrototype(receiver_prototype) &&
+         !IsReadOnlyLengthDescriptor(receiver_map);
+}
+
+}  // namespace
+
+// ES6 section 22.1.3.18 Array.prototype.push ( )
+Reduction JSCallReducer::ReduceArrayPrototypePush(Node* node) {
+  DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+  CallParameters const& p = CallParametersOf(node->op());
+  if (p.speculation_mode() == SpeculationMode::kDisallowSpeculation) {
+    return NoChange();
+  }
+
+  if (!isolate()->IsNoElementsProtectorIntact()) return NoChange();
+
+  int const num_values = node->op()->ValueInputCount() - 2;
+  Node* receiver = NodeProperties::GetValueInput(node, 1);
+  Node* effect = NodeProperties::GetEffectInput(node);
+  Node* control = NodeProperties::GetControlInput(node);
+
+  // Try to determine the {receiver} map(s).
+  ZoneHandleSet<Map> receiver_maps;
+  NodeProperties::InferReceiverMapsResult result =
+      NodeProperties::InferReceiverMaps(receiver, effect, &receiver_maps);
+  if (result == NodeProperties::kNoReceiverMaps) return NoChange();
+  DCHECK_NE(0, receiver_maps.size());
+
+  ElementsKind kind = receiver_maps[0]->elements_kind();
+
+  for (Handle<Map> receiver_map : receiver_maps) {
+    if (!CanInlineArrayResizeOperation(receiver_map)) return NoChange();
+    if (!UnionElementsKindUptoPackedness(&kind, receiver_map->elements_kind()))
+      return NoChange();
+  }
+
+  // Install code dependencies on the {receiver} global array protector cell.
+  dependencies()->AssumePropertyCell(factory()->no_elements_protector());
+
+  // If the {receiver_maps} information is not reliable, we need
+  // to check that the {receiver} still has one of these maps.
+  if (result == NodeProperties::kUnreliableReceiverMaps) {
+    effect =
+        graph()->NewNode(simplified()->CheckMaps(CheckMapsFlag::kNone,
+                                                 receiver_maps, p.feedback()),
+                         receiver, effect, control);
+  }
+
+  // Collect the value inputs to push.
+  std::vector<Node*> values(num_values);
+  for (int i = 0; i < num_values; ++i) {
+    values[i] = NodeProperties::GetValueInput(node, 2 + i);
+  }
+
+  for (auto& value : values) {
+    if (IsSmiElementsKind(kind)) {
+      value = effect = graph()->NewNode(simplified()->CheckSmi(p.feedback()),
+                                        value, effect, control);
+    } else if (IsDoubleElementsKind(kind)) {
+      value = effect = graph()->NewNode(simplified()->CheckNumber(p.feedback()),
+                                        value, effect, control);
+      // Make sure we do not store signaling NaNs into double arrays.
+      value = graph()->NewNode(simplified()->NumberSilenceNaN(), value);
+    }
+  }
+
+  // Load the "length" property of the {receiver}.
+  Node* length = effect = graph()->NewNode(
+      simplified()->LoadField(AccessBuilder::ForJSArrayLength(kind)), receiver,
+      effect, control);
+  Node* value = length;
+
+  // Check if we have any {values} to push.
+  if (num_values > 0) {
+    // Compute the resulting "length" of the {receiver}.
+    Node* new_length = value = graph()->NewNode(
+        simplified()->NumberAdd(), length, jsgraph()->Constant(num_values));
+
+    // Load the elements backing store of the {receiver}.
+    Node* elements = effect = graph()->NewNode(
+        simplified()->LoadField(AccessBuilder::ForJSObjectElements()), receiver,
+        effect, control);
+    Node* elements_length = effect = graph()->NewNode(
+        simplified()->LoadField(AccessBuilder::ForFixedArrayLength()), elements,
+        effect, control);
+
+    GrowFastElementsMode mode =
+        IsDoubleElementsKind(kind) ? GrowFastElementsMode::kDoubleElements
+                                   : GrowFastElementsMode::kSmiOrObjectElements;
+    elements = effect = graph()->NewNode(
+        simplified()->MaybeGrowFastElements(mode, p.feedback()), receiver,
+        elements,
+        graph()->NewNode(simplified()->NumberAdd(), length,
+                         jsgraph()->Constant(num_values - 1)),
+        elements_length, effect, control);
+
+    // Update the JSArray::length field. Since this is observable,
+    // there must be no other check after this.
+    effect = graph()->NewNode(
+        simplified()->StoreField(AccessBuilder::ForJSArrayLength(kind)),
+        receiver, new_length, effect, control);
+
+    // Append the {values} to the {elements}.
+    for (int i = 0; i < num_values; ++i) {
+      Node* value = values[i];
+      Node* index = graph()->NewNode(simplified()->NumberAdd(), length,
+                                     jsgraph()->Constant(i));
+      effect = graph()->NewNode(
+          simplified()->StoreElement(AccessBuilder::ForFixedArrayElement(kind)),
+          elements, index, value, effect, control);
+    }
+  }
+
+  ReplaceWithValue(node, value, effect, control);
+  return Replace(value);
+}
+
+// ES6 section 22.1.3.17 Array.prototype.pop ( )
+Reduction JSCallReducer::ReduceArrayPrototypePop(Node* node) {
+  DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+  CallParameters const& p = CallParametersOf(node->op());
+  if (p.speculation_mode() == SpeculationMode::kDisallowSpeculation) {
+    return NoChange();
+  }
+
+  if (!isolate()->IsNoElementsProtectorIntact()) return NoChange();
+
+  Node* receiver = NodeProperties::GetValueInput(node, 1);
+  Node* effect = NodeProperties::GetEffectInput(node);
+  Node* control = NodeProperties::GetControlInput(node);
+
+  ZoneHandleSet<Map> receiver_maps;
+  NodeProperties::InferReceiverMapsResult result =
+      NodeProperties::InferReceiverMaps(receiver, effect, &receiver_maps);
+  if (result == NodeProperties::kNoReceiverMaps) return NoChange();
+  DCHECK_NE(0, receiver_maps.size());
+
+  ElementsKind kind = receiver_maps[0]->elements_kind();
+  for (Handle<Map> receiver_map : receiver_maps) {
+    if (!CanInlineArrayResizeOperation(receiver_map)) return NoChange();
+    // TODO(turbofan): Extend this to also handle fast holey double elements
+    // once we got the hole NaN mess sorted out in TurboFan/V8.
+    if (receiver_map->elements_kind() == HOLEY_DOUBLE_ELEMENTS)
+      return NoChange();
+    if (!UnionElementsKindUptoSize(&kind, receiver_map->elements_kind()))
+      return NoChange();
+  }
+
+  // Install code dependencies on the {receiver} global array protector cell.
+  dependencies()->AssumePropertyCell(factory()->no_elements_protector());
+
+  // If the {receiver_maps} information is not reliable, we need
+  // to check that the {receiver} still has one of these maps.
+  if (result == NodeProperties::kUnreliableReceiverMaps) {
+    effect =
+        graph()->NewNode(simplified()->CheckMaps(CheckMapsFlag::kNone,
+                                                 receiver_maps, p.feedback()),
+                         receiver, effect, control);
+  }
+
+  // Load the "length" property of the {receiver}.
+  Node* length = effect = graph()->NewNode(
+      simplified()->LoadField(AccessBuilder::ForJSArrayLength(kind)), receiver,
+      effect, control);
+
+  // Check if the {receiver} has any elements.
+  Node* check = graph()->NewNode(simplified()->NumberEqual(), length,
+                                 jsgraph()->ZeroConstant());
+  Node* branch =
+      graph()->NewNode(common()->Branch(BranchHint::kFalse), check, control);
+
+  Node* if_true = graph()->NewNode(common()->IfTrue(), branch);
+  Node* etrue = effect;
+  Node* vtrue = jsgraph()->UndefinedConstant();
+
+  Node* if_false = graph()->NewNode(common()->IfFalse(), branch);
+  Node* efalse = effect;
+  Node* vfalse;
+  {
+    // TODO(tebbi): We should trim the backing store if the capacity is too
+    // big, as implemented in elements.cc:ElementsAccessorBase::SetLengthImpl.
+
+    // Load the elements backing store from the {receiver}.
+    Node* elements = efalse = graph()->NewNode(
+        simplified()->LoadField(AccessBuilder::ForJSObjectElements()), receiver,
+        efalse, if_false);
+
+    // Ensure that we aren't popping from a copy-on-write backing store.
+    if (IsSmiOrObjectElementsKind(kind)) {
+      elements = efalse =
+          graph()->NewNode(simplified()->EnsureWritableFastElements(), receiver,
+                           elements, efalse, if_false);
+    }
+
+    // Compute the new {length}.
+    length = graph()->NewNode(simplified()->NumberSubtract(), length,
+                              jsgraph()->OneConstant());
+
+    // Store the new {length} to the {receiver}.
+    efalse = graph()->NewNode(
+        simplified()->StoreField(AccessBuilder::ForJSArrayLength(kind)),
+        receiver, length, efalse, if_false);
+
+    // Load the last entry from the {elements}.
+    vfalse = efalse = graph()->NewNode(
+        simplified()->LoadElement(AccessBuilder::ForFixedArrayElement(kind)),
+        elements, length, efalse, if_false);
+
+    // Store a hole to the element we just removed from the {receiver}.
+    efalse = graph()->NewNode(
+        simplified()->StoreElement(
+            AccessBuilder::ForFixedArrayElement(GetHoleyElementsKind(kind))),
+        elements, length, jsgraph()->TheHoleConstant(), efalse, if_false);
+  }
+
+  control = graph()->NewNode(common()->Merge(2), if_true, if_false);
+  effect = graph()->NewNode(common()->EffectPhi(2), etrue, efalse, control);
+  Node* value = graph()->NewNode(
+      common()->Phi(MachineRepresentation::kTagged, 2), vtrue, vfalse, control);
+
+  // Convert the hole to undefined. Do this last, so that we can optimize
+  // conversion operator via some smart strength reduction in many cases.
+  if (IsHoleyElementsKind(kind)) {
+    value =
+        graph()->NewNode(simplified()->ConvertTaggedHoleToUndefined(), value);
+  }
+
+  ReplaceWithValue(node, value, effect, control);
+  return Replace(value);
+}
+
+// ES6 section 22.1.3.22 Array.prototype.shift ( )
+Reduction JSCallReducer::ReduceArrayPrototypeShift(Node* node) {
+  DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+  CallParameters const& p = CallParametersOf(node->op());
+  if (p.speculation_mode() == SpeculationMode::kDisallowSpeculation) {
+    return NoChange();
+  }
+
+  if (!isolate()->IsNoElementsProtectorIntact()) return NoChange();
+  Node* target = NodeProperties::GetValueInput(node, 0);
+  Node* receiver = NodeProperties::GetValueInput(node, 1);
+  Node* context = NodeProperties::GetContextInput(node);
+  Node* frame_state = NodeProperties::GetFrameStateInput(node);
+  Node* effect = NodeProperties::GetEffectInput(node);
+  Node* control = NodeProperties::GetControlInput(node);
+
+  ZoneHandleSet<Map> receiver_maps;
+  NodeProperties::InferReceiverMapsResult result =
+      NodeProperties::InferReceiverMaps(receiver, effect, &receiver_maps);
+  if (result == NodeProperties::kNoReceiverMaps) return NoChange();
+  DCHECK_NE(0, receiver_maps.size());
+
+  ElementsKind kind = receiver_maps[0]->elements_kind();
+  for (Handle<Map> receiver_map : receiver_maps) {
+    if (!CanInlineArrayResizeOperation(receiver_map)) return NoChange();
+    // TODO(turbofan): Extend this to also handle fast holey double elements
+    // once we got the hole NaN mess sorted out in TurboFan/V8.
+    if (receiver_map->elements_kind() == HOLEY_DOUBLE_ELEMENTS)
+      return NoChange();
+    if (!UnionElementsKindUptoSize(&kind, receiver_map->elements_kind()))
+      return NoChange();
+  }
+
+  // Install code dependencies on the {receiver} global array protector cell.
+  dependencies()->AssumePropertyCell(factory()->no_elements_protector());
+
+  // If the {receiver_maps} information is not reliable, we need
+  // to check that the {receiver} still has one of these maps.
+  if (result == NodeProperties::kUnreliableReceiverMaps) {
+    effect =
+        graph()->NewNode(simplified()->CheckMaps(CheckMapsFlag::kNone,
+                                                 receiver_maps, p.feedback()),
+                         receiver, effect, control);
+  }
+
+  // Load length of the {receiver}.
+  Node* length = effect = graph()->NewNode(
+      simplified()->LoadField(AccessBuilder::ForJSArrayLength(kind)), receiver,
+      effect, control);
+
+  // Return undefined if {receiver} has no elements.
+  Node* check0 = graph()->NewNode(simplified()->NumberEqual(), length,
+                                  jsgraph()->ZeroConstant());
+  Node* branch0 =
+      graph()->NewNode(common()->Branch(BranchHint::kFalse), check0, control);
+
+  Node* if_true0 = graph()->NewNode(common()->IfTrue(), branch0);
+  Node* etrue0 = effect;
+  Node* vtrue0 = jsgraph()->UndefinedConstant();
+
+  Node* if_false0 = graph()->NewNode(common()->IfFalse(), branch0);
+  Node* efalse0 = effect;
+  Node* vfalse0;
+  {
+    // Check if we should take the fast-path.
+    Node* check1 =
+        graph()->NewNode(simplified()->NumberLessThanOrEqual(), length,
+                         jsgraph()->Constant(JSArray::kMaxCopyElements));
+    Node* branch1 = graph()->NewNode(common()->Branch(BranchHint::kTrue),
+                                     check1, if_false0);
+
+    Node* if_true1 = graph()->NewNode(common()->IfTrue(), branch1);
+    Node* etrue1 = efalse0;
+    Node* vtrue1;
+    {
+      Node* elements = etrue1 = graph()->NewNode(
+          simplified()->LoadField(AccessBuilder::ForJSObjectElements()),
+          receiver, etrue1, if_true1);
+
+      // Load the first element here, which we return below.
+      vtrue1 = etrue1 = graph()->NewNode(
+          simplified()->LoadElement(AccessBuilder::ForFixedArrayElement(kind)),
+          elements, jsgraph()->ZeroConstant(), etrue1, if_true1);
+
+      // Ensure that we aren't shifting a copy-on-write backing store.
+      if (IsSmiOrObjectElementsKind(kind)) {
+        elements = etrue1 =
+            graph()->NewNode(simplified()->EnsureWritableFastElements(),
+                             receiver, elements, etrue1, if_true1);
+      }
+
+      // Shift the remaining {elements} by one towards the start.
+      Node* loop = graph()->NewNode(common()->Loop(2), if_true1, if_true1);
+      Node* eloop =
+          graph()->NewNode(common()->EffectPhi(2), etrue1, etrue1, loop);
+      Node* terminate = graph()->NewNode(common()->Terminate(), eloop, loop);
+      NodeProperties::MergeControlToEnd(graph(), common(), terminate);
+      Node* index = graph()->NewNode(
+          common()->Phi(MachineRepresentation::kTagged, 2),
+          jsgraph()->OneConstant(),
+          jsgraph()->Constant(JSArray::kMaxCopyElements - 1), loop);
+
+      {
+        Node* check2 =
+            graph()->NewNode(simplified()->NumberLessThan(), index, length);
+        Node* branch2 = graph()->NewNode(common()->Branch(), check2, loop);
+
+        if_true1 = graph()->NewNode(common()->IfFalse(), branch2);
+        etrue1 = eloop;
+
+        Node* control = graph()->NewNode(common()->IfTrue(), branch2);
+        Node* effect = etrue1;
+
+        ElementAccess const access = AccessBuilder::ForFixedArrayElement(kind);
+        Node* value = effect =
+            graph()->NewNode(simplified()->LoadElement(access), elements, index,
+                             effect, control);
+        effect =
+            graph()->NewNode(simplified()->StoreElement(access), elements,
+                             graph()->NewNode(simplified()->NumberSubtract(),
+                                              index, jsgraph()->OneConstant()),
+                             value, effect, control);
+
+        loop->ReplaceInput(1, control);
+        eloop->ReplaceInput(1, effect);
+        index->ReplaceInput(1,
+                            graph()->NewNode(simplified()->NumberAdd(), index,
+                                             jsgraph()->OneConstant()));
+      }
+
+      // Compute the new {length}.
+      length = graph()->NewNode(simplified()->NumberSubtract(), length,
+                                jsgraph()->OneConstant());
+
+      // Store the new {length} to the {receiver}.
+      etrue1 = graph()->NewNode(
+          simplified()->StoreField(AccessBuilder::ForJSArrayLength(kind)),
+          receiver, length, etrue1, if_true1);
+
+      // Store a hole to the element we just removed from the {receiver}.
+      etrue1 = graph()->NewNode(
+          simplified()->StoreElement(
+              AccessBuilder::ForFixedArrayElement(GetHoleyElementsKind(kind))),
+          elements, length, jsgraph()->TheHoleConstant(), etrue1, if_true1);
+    }
+
+    Node* if_false1 = graph()->NewNode(common()->IfFalse(), branch1);
+    Node* efalse1 = efalse0;
+    Node* vfalse1;
+    {
+      // Call the generic C++ implementation.
+      const int builtin_index = Builtins::kArrayShift;
+      auto call_descriptor = Linkage::GetCEntryStubCallDescriptor(
+          graph()->zone(), 1, BuiltinArguments::kNumExtraArgsWithReceiver,
+          Builtins::name(builtin_index), node->op()->properties(),
+          CallDescriptor::kNeedsFrameState);
+      Node* stub_code =
+          jsgraph()->CEntryStubConstant(1, kDontSaveFPRegs, kArgvOnStack, true);
+      Address builtin_entry = Builtins::CppEntryOf(builtin_index);
+      Node* entry = jsgraph()->ExternalConstant(
+          ExternalReference(builtin_entry, isolate()));
+      Node* argc =
+          jsgraph()->Constant(BuiltinArguments::kNumExtraArgsWithReceiver);
+      if_false1 = efalse1 = vfalse1 =
+          graph()->NewNode(common()->Call(call_descriptor), stub_code, receiver,
+                           jsgraph()->PaddingConstant(), argc, target,
+                           jsgraph()->UndefinedConstant(), entry, argc, context,
+                           frame_state, efalse1, if_false1);
+    }
+
+    if_false0 = graph()->NewNode(common()->Merge(2), if_true1, if_false1);
+    efalse0 =
+        graph()->NewNode(common()->EffectPhi(2), etrue1, efalse1, if_false0);
+    vfalse0 = graph()->NewNode(common()->Phi(MachineRepresentation::kTagged, 2),
+                               vtrue1, vfalse1, if_false0);
+    }
+
+    control = graph()->NewNode(common()->Merge(2), if_true0, if_false0);
+    effect = graph()->NewNode(common()->EffectPhi(2), etrue0, efalse0, control);
+    Node* value =
+        graph()->NewNode(common()->Phi(MachineRepresentation::kTagged, 2),
+                         vtrue0, vfalse0, control);
+
+    // Convert the hole to undefined. Do this last, so that we can optimize
+    // conversion operator via some smart strength reduction in many cases.
+    if (IsHoleyElementsKind(kind)) {
+      value =
+          graph()->NewNode(simplified()->ConvertTaggedHoleToUndefined(), value);
+    }
+
+    ReplaceWithValue(node, value, effect, control);
+    return Replace(value);
+}
+
+// ES6 section 21.1.3.1 String.prototype.charAt ( pos )
+// and
+// ES6 section 21.1.3.2 String.prototype.charCodeAt ( pos )
+// and
+// ES6 section 21.1.3.3 String.prototype.codePointAt ( pos )
+Reduction JSCallReducer::ReduceStringPrototypeStringAt(
+    const Operator* string_access_operator, Node* node) {
+  DCHECK(string_access_operator->opcode() == IrOpcode::kStringCharAt ||
+         string_access_operator->opcode() == IrOpcode::kStringCharCodeAt ||
+         string_access_operator->opcode() == IrOpcode::kStringCodePointAt);
+  DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+  CallParameters const& p = CallParametersOf(node->op());
+  if (p.speculation_mode() == SpeculationMode::kDisallowSpeculation) {
+    return NoChange();
+  }
+
+  Node* receiver = NodeProperties::GetValueInput(node, 1);
+  Node* index = node->op()->ValueInputCount() >= 3
+                    ? NodeProperties::GetValueInput(node, 2)
+                    : jsgraph()->ZeroConstant();
+  Node* effect = NodeProperties::GetEffectInput(node);
+  Node* control = NodeProperties::GetControlInput(node);
+
+  // Ensure that the {receiver} is actually a String.
+  receiver = effect = graph()->NewNode(simplified()->CheckString(p.feedback()),
+                                       receiver, effect, control);
+
+  // Determine the {receiver} length.
+  Node* receiver_length =
+      graph()->NewNode(simplified()->StringLength(), receiver);
+
+  // Check that the {index} is within range.
+  index = effect = graph()->NewNode(simplified()->CheckBounds(p.feedback()),
+                                    index, receiver_length, effect, control);
+
+  // Return the character from the {receiver} as single character string.
+  Node* masked_index = graph()->NewNode(simplified()->MaskIndexWithBound(),
+                                        index, receiver_length);
+  Node* value = effect = graph()->NewNode(string_access_operator, receiver,
+                                          masked_index, effect, control);
+
+  ReplaceWithValue(node, value, effect, control);
+  return Replace(value);
+}
+
+Reduction JSCallReducer::ReduceAsyncFunctionPromiseCreate(Node* node) {
+  DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+  Node* context = NodeProperties::GetContextInput(node);
+  Node* effect = NodeProperties::GetEffectInput(node);
+  if (!isolate()->IsPromiseHookProtectorIntact()) return NoChange();
+
+  // Install a code dependency on the promise hook protector cell.
+  dependencies()->AssumePropertyCell(factory()->promise_hook_protector());
+
+  // Morph this {node} into a JSCreatePromise node.
+  RelaxControls(node);
+  node->ReplaceInput(0, context);
+  node->ReplaceInput(1, effect);
+  node->TrimInputCount(2);
+  NodeProperties::ChangeOp(node, javascript()->CreatePromise());
+  return Changed(node);
+}
+
+Reduction JSCallReducer::ReduceAsyncFunctionPromiseRelease(Node* node) {
+  DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+  if (!isolate()->IsPromiseHookProtectorIntact()) return NoChange();
+
+  // Install a code dependency on the promise hook protector cell.
+  dependencies()->AssumePropertyCell(factory()->promise_hook_protector());
+
+  // The AsyncFunctionPromiseRelease builtin is a no-op as long as neither
+  // the debugger is active nor any promise hook has been installed (ever).
+  Node* value = jsgraph()->UndefinedConstant();
+  ReplaceWithValue(node, value);
+  return Replace(value);
+}
+
+// ES section #sec-promise-reject-functions
+Reduction JSCallReducer::ReducePromiseCapabilityDefaultReject(Node* node) {
+  DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+  Node* target = NodeProperties::GetValueInput(node, 0);
+  Node* resolution = node->op()->ValueInputCount() > 2
+                         ? NodeProperties::GetValueInput(node, 2)
+                         : jsgraph()->UndefinedConstant();
+  Node* frame_state = NodeProperties::GetFrameStateInput(node);
+  Node* effect = NodeProperties::GetEffectInput(node);
+  Node* control = NodeProperties::GetControlInput(node);
+
+  // We need to execute in the {target}s context.
+  Node* context = effect = graph()->NewNode(
+      simplified()->LoadField(AccessBuilder::ForJSFunctionContext()), target,
+      effect, control);
+
+  // Grab the promise closed over by {target}.
+  Node* promise = effect =
+      graph()->NewNode(simplified()->LoadField(AccessBuilder::ForContextSlot(
+                           PromiseBuiltinsAssembler::kPromiseSlot)),
+                       context, effect, control);
+
+  // Check if the {promise} is still pending or already settled.
+  Node* check = graph()->NewNode(simplified()->ReferenceEqual(), promise,
+                                 jsgraph()->UndefinedConstant());
+  Node* branch =
+      graph()->NewNode(common()->Branch(BranchHint::kFalse), check, control);
+
+  Node* if_true = graph()->NewNode(common()->IfTrue(), branch);
+  Node* etrue = effect;
+
+  Node* if_false = graph()->NewNode(common()->IfFalse(), branch);
+  Node* efalse = effect;
+  {
+    // Mark the {promise} as settled.
+    efalse = graph()->NewNode(
+        simplified()->StoreField(AccessBuilder::ForContextSlot(
+            PromiseBuiltinsAssembler::kPromiseSlot)),
+        context, jsgraph()->UndefinedConstant(), efalse, if_false);
+
+    // Check if we should emit a debug event.
+    Node* debug_event = efalse =
+        graph()->NewNode(simplified()->LoadField(AccessBuilder::ForContextSlot(
+                             PromiseBuiltinsAssembler::kDebugEventSlot)),
+                         context, efalse, if_false);
+
+    // Actually reject the {promise}.
+    efalse =
+        graph()->NewNode(javascript()->RejectPromise(), promise, resolution,
+                         debug_event, context, frame_state, efalse, if_false);
+  }
+
+  control = graph()->NewNode(common()->Merge(2), if_true, if_false);
+  effect = graph()->NewNode(common()->EffectPhi(2), etrue, efalse, control);
+
+  Node* value = jsgraph()->UndefinedConstant();
+  ReplaceWithValue(node, value, effect, control);
+  return Replace(value);
+}
+
+// ES section #sec-promise-resolve-functions
+Reduction JSCallReducer::ReducePromiseCapabilityDefaultResolve(Node* node) {
+  DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+  Node* target = NodeProperties::GetValueInput(node, 0);
+  Node* resolution = node->op()->ValueInputCount() > 2
+                         ? NodeProperties::GetValueInput(node, 2)
+                         : jsgraph()->UndefinedConstant();
+  Node* frame_state = NodeProperties::GetFrameStateInput(node);
+  Node* effect = NodeProperties::GetEffectInput(node);
+  Node* control = NodeProperties::GetControlInput(node);
+
+  // We need to execute in the {target}s context.
+  Node* context = effect = graph()->NewNode(
+      simplified()->LoadField(AccessBuilder::ForJSFunctionContext()), target,
+      effect, control);
+
+  // Grab the promise closed over by {target}.
+  Node* promise = effect =
+      graph()->NewNode(simplified()->LoadField(AccessBuilder::ForContextSlot(
+                           PromiseBuiltinsAssembler::kPromiseSlot)),
+                       context, effect, control);
+
+  // Check if the {promise} is still pending or already settled.
+  Node* check = graph()->NewNode(simplified()->ReferenceEqual(), promise,
+                                 jsgraph()->UndefinedConstant());
+  Node* branch =
+      graph()->NewNode(common()->Branch(BranchHint::kFalse), check, control);
+
+  Node* if_true = graph()->NewNode(common()->IfTrue(), branch);
+  Node* etrue = effect;
+
+  Node* if_false = graph()->NewNode(common()->IfFalse(), branch);
+  Node* efalse = effect;
+  {
+    // Mark the {promise} as settled.
+    efalse = graph()->NewNode(
+        simplified()->StoreField(AccessBuilder::ForContextSlot(
+            PromiseBuiltinsAssembler::kPromiseSlot)),
+        context, jsgraph()->UndefinedConstant(), efalse, if_false);
+
+    // Actually resolve the {promise}.
+    efalse =
+        graph()->NewNode(javascript()->ResolvePromise(), promise, resolution,
+                         context, frame_state, efalse, if_false);
+  }
+
+  control = graph()->NewNode(common()->Merge(2), if_true, if_false);
+  effect = graph()->NewNode(common()->EffectPhi(2), etrue, efalse, control);
+
+  Node* value = jsgraph()->UndefinedConstant();
+  ReplaceWithValue(node, value, effect, control);
+  return Replace(value);
+}
+
+Reduction JSCallReducer::ReducePromiseConstructor(Node* node) {
+  DCHECK_EQ(IrOpcode::kJSConstruct, node->opcode());
+  ConstructParameters const& p = ConstructParametersOf(node->op());
+  int arity = static_cast<int>(p.arity() - 2);
+  // We only inline when we have the executor.
+  if (arity < 1) return NoChange();
+  Node* target = NodeProperties::GetValueInput(node, 0);
+  Node* executor = NodeProperties::GetValueInput(node, 1);
+  Node* new_target = NodeProperties::GetValueInput(node, arity + 1);
+
+  Node* context = NodeProperties::GetContextInput(node);
+  Node* outer_frame_state = NodeProperties::GetFrameStateInput(node);
+  Node* effect = NodeProperties::GetEffectInput(node);
+  Node* control = NodeProperties::GetControlInput(node);
+
+  if (!FLAG_experimental_inline_promise_constructor) return NoChange();
+
+  // Only handle builtins Promises, not subclasses.
+  if (target != new_target) return NoChange();
+
+  // Add a code dependency on the promise hook protector.
+  dependencies()->AssumePropertyCell(factory()->promise_hook_protector());
+
+  // Check if executor is callable
+  Node* check_fail = nullptr;
+  Node* check_throw = nullptr;
+  // TODO(petermarshall): The frame state is wrong here.
+  WireInCallbackIsCallableCheck(executor, context, outer_frame_state, effect,
+                                &control, &check_fail, &check_throw);
+
+  // Create the resulting JSPromise.
+  Node* promise = effect =
+      graph()->NewNode(javascript()->CreatePromise(), context, effect);
+
+  // 8. CreatePromiseResolvingFunctions
+  // Allocate a promise context for the closures below.
+  Node* promise_context = effect = graph()->NewNode(
+      javascript()->CreateFunctionContext(
+          PromiseBuiltinsAssembler::kPromiseContextLength, FUNCTION_SCOPE),
+      context, context, effect, control);
+  effect =
+      graph()->NewNode(simplified()->StoreField(AccessBuilder::ForContextSlot(
+                           PromiseBuiltinsAssembler::kPromiseSlot)),
+                       promise_context, promise, effect, control);
+  effect = graph()->NewNode(
+      simplified()->StoreField(AccessBuilder::ForContextSlot(
+          PromiseBuiltinsAssembler::kDebugEventSlot)),
+      promise_context, jsgraph()->TrueConstant(), effect, control);
+
+  // Allocate the closure for the resolve case.
+  Handle<SharedFunctionInfo> resolve_shared(
+      native_context()->promise_capability_default_resolve_shared_fun(),
+      isolate());
+  Node* resolve = effect =
+      graph()->NewNode(javascript()->CreateClosure(resolve_shared),
+                       promise_context, effect, control);
+
+  // Allocate the closure for the reject case.
+  Handle<SharedFunctionInfo> reject_shared(
+      native_context()->promise_capability_default_reject_shared_fun(),
+      isolate());
+  Node* reject = effect =
+      graph()->NewNode(javascript()->CreateClosure(reject_shared),
+                       promise_context, effect, control);
+
+  Handle<SharedFunctionInfo> promise_function_info =
+      handle(native_context()->promise_function()->shared());
+
+  // The first param is undefined for the receiver.
+  std::vector<Node*> checkpoint_params(
+      {jsgraph()->UndefinedConstant(), promise});
+  const int stack_parameters = static_cast<int>(checkpoint_params.size());
+
+  // This simple continuation just returns the created promise.
+  // TODO(petermarshall): If the executor function causes lazy deopt, and it
+  // also throws an exception, we should catch the exception and call the reject
+  // function.
+  Node* frame_state = CreateJavaScriptBuiltinContinuationFrameState(
+      jsgraph(), promise_function_info,
+      Builtins::kPromiseConstructorLazyDeoptContinuation, target, context,
+      &checkpoint_params[0], stack_parameters, outer_frame_state,
+      ContinuationFrameStateMode::LAZY);
+
+  // 9. Call executor with both resolving functions
+  effect = control = graph()->NewNode(
+      javascript()->Call(4, p.frequency(), VectorSlotPair(),
+                         ConvertReceiverMode::kNullOrUndefined,
+                         SpeculationMode::kDisallowSpeculation),
+      executor, jsgraph()->UndefinedConstant(), resolve, reject, context,
+      frame_state, effect, control);
+
+  Node* exception_effect = effect;
+  Node* exception_control = control;
+  {
+    Node* reason = exception_effect = exception_control = graph()->NewNode(
+        common()->IfException(), exception_control, exception_effect);
+    // 10a. Call reject if the call to executor threw.
+    exception_effect = exception_control = graph()->NewNode(
+        javascript()->Call(3, p.frequency(), VectorSlotPair(),
+                           ConvertReceiverMode::kNullOrUndefined,
+                           SpeculationMode::kDisallowSpeculation),
+        reject, jsgraph()->UndefinedConstant(), reason, context,
+        outer_frame_state, exception_effect, exception_control);
+
+    // Rewire potential exception edges.
+    Node* on_exception = nullptr;
+    if (NodeProperties::IsExceptionalCall(node, &on_exception)) {
+      RewirePostCallbackExceptionEdges(check_throw, on_exception,
+                                       exception_effect, &check_fail,
+                                       &exception_control);
+    }
+  }
+
+  Node* success_effect = effect;
+  Node* success_control = control;
+  {
+    success_control = graph()->NewNode(common()->IfSuccess(), success_control);
+  }
+
+  control =
+      graph()->NewNode(common()->Merge(2), success_control, exception_control);
+  effect = graph()->NewNode(common()->EffectPhi(2), success_effect,
+                            exception_effect, control);
+
+  // Wire up the branch for the case when IsCallable fails for the executor.
+  // Since {check_throw} is an unconditional throw, it's impossible to
+  // return a successful completion. Therefore, we simply connect the successful
+  // completion to the graph end.
+  Node* throw_node =
+      graph()->NewNode(common()->Throw(), check_throw, check_fail);
+  NodeProperties::MergeControlToEnd(graph(), common(), throw_node);
+
+  ReplaceWithValue(node, promise, effect, control);
+  return Replace(promise);
+}
+
+// V8 Extras: v8.createPromise(parent)
+Reduction JSCallReducer::ReducePromiseInternalConstructor(Node* node) {
+  DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+  Node* context = NodeProperties::GetContextInput(node);
+  Node* effect = NodeProperties::GetEffectInput(node);
+
+  // Check that promises aren't being observed through (debug) hooks.
+  if (!isolate()->IsPromiseHookProtectorIntact()) return NoChange();
+
+  // Install a code dependency on the promise hook protector cell.
+  dependencies()->AssumePropertyCell(factory()->promise_hook_protector());
+
+  // Create a new pending promise.
+  Node* value = effect =
+      graph()->NewNode(javascript()->CreatePromise(), context, effect);
+
+  ReplaceWithValue(node, value, effect);
+  return Replace(value);
+}
+
+// V8 Extras: v8.rejectPromise(promise, reason)
+Reduction JSCallReducer::ReducePromiseInternalReject(Node* node) {
+  DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+  Node* promise = node->op()->ValueInputCount() >= 2
+                      ? NodeProperties::GetValueInput(node, 2)
+                      : jsgraph()->UndefinedConstant();
+  Node* reason = node->op()->ValueInputCount() >= 3
+                     ? NodeProperties::GetValueInput(node, 3)
+                     : jsgraph()->UndefinedConstant();
+  Node* debug_event = jsgraph()->TrueConstant();
+  Node* frame_state = NodeProperties::GetFrameStateInput(node);
+  Node* context = NodeProperties::GetContextInput(node);
+  Node* effect = NodeProperties::GetEffectInput(node);
+  Node* control = NodeProperties::GetControlInput(node);
+
+  // Reject the {promise} using the given {reason}, and trigger debug logic.
+  Node* value = effect =
+      graph()->NewNode(javascript()->RejectPromise(), promise, reason,
+                       debug_event, context, frame_state, effect, control);
+
+  ReplaceWithValue(node, value, effect, control);
+  return Replace(value);
+}
+
+// V8 Extras: v8.resolvePromise(promise, resolution)
+Reduction JSCallReducer::ReducePromiseInternalResolve(Node* node) {
+  DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+  Node* promise = node->op()->ValueInputCount() >= 2
+                      ? NodeProperties::GetValueInput(node, 2)
+                      : jsgraph()->UndefinedConstant();
+  Node* resolution = node->op()->ValueInputCount() >= 3
+                         ? NodeProperties::GetValueInput(node, 3)
+                         : jsgraph()->UndefinedConstant();
+  Node* frame_state = NodeProperties::GetFrameStateInput(node);
+  Node* context = NodeProperties::GetContextInput(node);
+  Node* effect = NodeProperties::GetEffectInput(node);
+  Node* control = NodeProperties::GetControlInput(node);
+
+  // Resolve the {promise} using the given {resolution}.
+  Node* value = effect =
+      graph()->NewNode(javascript()->ResolvePromise(), promise, resolution,
+                       context, frame_state, effect, control);
+
+  ReplaceWithValue(node, value, effect, control);
+  return Replace(value);
+}
+
+// ES section #sec-promise.prototype.catch
+Reduction JSCallReducer::ReducePromisePrototypeCatch(Node* node) {
+  DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+  CallParameters const& p = CallParametersOf(node->op());
+  int arity = static_cast<int>(p.arity() - 2);
+  Node* receiver = NodeProperties::GetValueInput(node, 1);
+  Node* effect = NodeProperties::GetEffectInput(node);
+  Node* control = NodeProperties::GetControlInput(node);
+  if (p.speculation_mode() == SpeculationMode::kDisallowSpeculation) {
+    return NoChange();
+  }
+
+  // Check that the Promise.then protector is intact. This protector guards
+  // that all JSPromise instances whose [[Prototype]] is the initial
+  // %PromisePrototype% yield the initial %PromisePrototype%.then method
+  // when looking up "then".
+  if (!isolate()->IsPromiseThenLookupChainIntact()) return NoChange();
+
+  // Check if we know something about {receiver} already.
+  ZoneHandleSet<Map> receiver_maps;
+  NodeProperties::InferReceiverMapsResult result =
+      NodeProperties::InferReceiverMaps(receiver, effect, &receiver_maps);
+  if (result == NodeProperties::kNoReceiverMaps) return NoChange();
+  DCHECK_NE(0, receiver_maps.size());
+
+  // Check whether all {receiver_maps} are JSPromise maps and
+  // have the initial Promise.prototype as their [[Prototype]].
+  for (Handle<Map> receiver_map : receiver_maps) {
+    if (!receiver_map->IsJSPromiseMap()) return NoChange();
+    if (receiver_map->prototype() != native_context()->promise_prototype()) {
+      return NoChange();
+    }
+  }
+
+  // Add a code dependency on the necessary protectors.
+  dependencies()->AssumePropertyCell(factory()->promise_then_protector());
+
+  // If the {receiver_maps} aren't reliable, we need to repeat the
+  // map check here, guarded by the CALL_IC.
+  if (result == NodeProperties::kUnreliableReceiverMaps) {
+    effect =
+        graph()->NewNode(simplified()->CheckMaps(CheckMapsFlag::kNone,
+                                                 receiver_maps, p.feedback()),
+                         receiver, effect, control);
+  }
+
+  // Massage the {node} to call "then" instead by first removing all inputs
+  // following the onRejected parameter, and then filling up the parameters
+  // to two inputs from the left with undefined.
+  Node* target = jsgraph()->Constant(handle(native_context()->promise_then()));
+  NodeProperties::ReplaceValueInput(node, target, 0);
+  NodeProperties::ReplaceEffectInput(node, effect);
+  for (; arity > 1; --arity) node->RemoveInput(3);
+  for (; arity < 2; ++arity) {
+    node->InsertInput(graph()->zone(), 2, jsgraph()->UndefinedConstant());
+  }
+  NodeProperties::ChangeOp(
+      node, javascript()->Call(2 + arity, p.frequency(), p.feedback(),
+                               ConvertReceiverMode::kNotNullOrUndefined,
+                               p.speculation_mode()));
+  Reduction const reduction = ReducePromisePrototypeThen(node);
+  return reduction.Changed() ? reduction : Changed(node);
+}
+
+// ES section #sec-promise.prototype.finally
+Reduction JSCallReducer::ReducePromisePrototypeFinally(Node* node) {
+  DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+  CallParameters const& p = CallParametersOf(node->op());
+  int arity = static_cast<int>(p.arity() - 2);
+  Node* receiver = NodeProperties::GetValueInput(node, 1);
+  Node* on_finally = arity >= 1 ? NodeProperties::GetValueInput(node, 2)
+                                : jsgraph()->UndefinedConstant();
+  Node* effect = NodeProperties::GetEffectInput(node);
+  Node* control = NodeProperties::GetControlInput(node);
+  if (p.speculation_mode() == SpeculationMode::kDisallowSpeculation) {
+    return NoChange();
+  }
+
+  // Check that promises aren't being observed through (debug) hooks.
+  if (!isolate()->IsPromiseHookProtectorIntact()) return NoChange();
+
+  // Check that the Promise#then protector is intact. This protector guards
+  // that all JSPromise instances whose [[Prototype]] is the initial
+  // %PromisePrototype% yield the initial %PromisePrototype%.then method
+  // when looking up "then".
+  if (!isolate()->IsPromiseThenLookupChainIntact()) return NoChange();
+
+  // Also check that the @@species protector is intact, which guards the
+  // lookup of "constructor" on JSPromise instances, whoch [[Prototype]] is
+  // the initial %PromisePrototype%, and the Symbol.species lookup on the
+  // %PromisePrototype%.
+  if (!isolate()->IsSpeciesLookupChainIntact()) return NoChange();
+
+  // Check if we know something about {receiver} already.
+  ZoneHandleSet<Map> receiver_maps;
+  NodeProperties::InferReceiverMapsResult result =
+      NodeProperties::InferReceiverMaps(receiver, effect, &receiver_maps);
+  if (result == NodeProperties::kNoReceiverMaps) return NoChange();
+  DCHECK_NE(0, receiver_maps.size());
+
+  // Check whether all {receiver_maps} are JSPromise maps and
+  // have the initial Promise.prototype as their [[Prototype]].
+  for (Handle<Map> receiver_map : receiver_maps) {
+    if (!receiver_map->IsJSPromiseMap()) return NoChange();
+    if (receiver_map->prototype() != native_context()->promise_prototype()) {
+      return NoChange();
+    }
+  }
+
+  // Add a code dependency on the necessary protectors.
+  dependencies()->AssumePropertyCell(factory()->promise_hook_protector());
+  dependencies()->AssumePropertyCell(factory()->promise_then_protector());
+  dependencies()->AssumePropertyCell(factory()->species_protector());
+
+  // If the {receiver_maps} aren't reliable, we need to repeat the
+  // map check here, guarded by the CALL_IC.
+  if (result == NodeProperties::kUnreliableReceiverMaps) {
+    effect =
+        graph()->NewNode(simplified()->CheckMaps(CheckMapsFlag::kNone,
+                                                 receiver_maps, p.feedback()),
+                         receiver, effect, control);
+  }
+
+  // Check if {on_finally} is callable, and if so wrap it into appropriate
+  // closures that perform the finalization.
+  Node* check = graph()->NewNode(simplified()->ObjectIsCallable(), on_finally);
+  Node* branch =
+      graph()->NewNode(common()->Branch(BranchHint::kTrue), check, control);
+
+  Node* if_true = graph()->NewNode(common()->IfTrue(), branch);
+  Node* etrue = effect;
+  Node* catch_true;
+  Node* then_true;
+  {
+    Node* context = jsgraph()->HeapConstant(native_context());
+    Node* constructor = jsgraph()->HeapConstant(
+        handle(native_context()->promise_function(), isolate()));
+
+    // Allocate shared context for the closures below.
+    context = etrue = graph()->NewNode(
+        javascript()->CreateFunctionContext(
+            PromiseBuiltinsAssembler::kPromiseFinallyContextLength,
+            FUNCTION_SCOPE),
+        context, context, etrue, if_true);
+    etrue =
+        graph()->NewNode(simplified()->StoreField(AccessBuilder::ForContextSlot(
+                             PromiseBuiltinsAssembler::kOnFinallySlot)),
+                         context, on_finally, etrue, if_true);
+    etrue =
+        graph()->NewNode(simplified()->StoreField(AccessBuilder::ForContextSlot(
+                             PromiseBuiltinsAssembler::kConstructorSlot)),
+                         context, constructor, etrue, if_true);
+
+    // Allocate the closure for the reject case.
+    Handle<SharedFunctionInfo> catch_finally(
+        native_context()->promise_catch_finally_shared_fun(), isolate());
+    catch_true = etrue = graph()->NewNode(
+        javascript()->CreateClosure(catch_finally), context, etrue, if_true);
+
+    // Allocate the closure for the fulfill case.
+    Handle<SharedFunctionInfo> then_finally(
+        native_context()->promise_then_finally_shared_fun(), isolate());
+    then_true = etrue = graph()->NewNode(
+        javascript()->CreateClosure(then_finally), context, etrue, if_true);
+  }
+
+  Node* if_false = graph()->NewNode(common()->IfFalse(), branch);
+  Node* efalse = effect;
+  Node* catch_false = on_finally;
+  Node* then_false = on_finally;
+
+  control = graph()->NewNode(common()->Merge(2), if_true, if_false);
+  effect = graph()->NewNode(common()->EffectPhi(2), etrue, efalse, control);
+  Node* catch_finally =
+      graph()->NewNode(common()->Phi(MachineRepresentation::kTagged, 2),
+                       catch_true, catch_false, control);
+  Node* then_finally =
+      graph()->NewNode(common()->Phi(MachineRepresentation::kTagged, 2),
+                       then_true, then_false, control);
+
+  // At this point we definitely know that {receiver} has one of the
+  // {receiver_maps}, so insert a MapGuard as a hint for the lowering
+  // of the call to "then" below.
+  effect = graph()->NewNode(simplified()->MapGuard(receiver_maps), receiver,
+                            effect, control);
+
+  // Massage the {node} to call "then" instead by first removing all inputs
+  // following the onFinally parameter, and then replacing the only parameter
+  // input with the {on_finally} value.
+  Node* target = jsgraph()->Constant(handle(native_context()->promise_then()));
+  NodeProperties::ReplaceValueInput(node, target, 0);
+  NodeProperties::ReplaceEffectInput(node, effect);
+  NodeProperties::ReplaceControlInput(node, control);
+  for (; arity > 2; --arity) node->RemoveInput(2);
+  for (; arity < 2; ++arity)
+    node->InsertInput(graph()->zone(), 2, then_finally);
+  node->ReplaceInput(2, then_finally);
+  node->ReplaceInput(3, catch_finally);
+  NodeProperties::ChangeOp(
+      node, javascript()->Call(2 + arity, p.frequency(), p.feedback(),
+                               ConvertReceiverMode::kNotNullOrUndefined,
+                               p.speculation_mode()));
+  Reduction const reduction = ReducePromisePrototypeThen(node);
+  return reduction.Changed() ? reduction : Changed(node);
+}
+
+Reduction JSCallReducer::ReducePromisePrototypeThen(Node* node) {
+  DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+  CallParameters const& p = CallParametersOf(node->op());
+  Node* receiver = NodeProperties::GetValueInput(node, 1);
+  Node* on_fulfilled = node->op()->ValueInputCount() > 2
+                           ? NodeProperties::GetValueInput(node, 2)
+                           : jsgraph()->UndefinedConstant();
+  Node* on_rejected = node->op()->ValueInputCount() > 3
+                          ? NodeProperties::GetValueInput(node, 3)
+                          : jsgraph()->UndefinedConstant();
+  Node* context = NodeProperties::GetContextInput(node);
+  Node* effect = NodeProperties::GetEffectInput(node);
+  Node* control = NodeProperties::GetControlInput(node);
+  if (p.speculation_mode() == SpeculationMode::kDisallowSpeculation) {
+    return NoChange();
+  }
+
+  // Check that promises aren't being observed through (debug) hooks.
+  if (!isolate()->IsPromiseHookProtectorIntact()) return NoChange();
+
+  // Check if the @@species protector is intact. The @@species protector
+  // guards the "constructor" lookup on all JSPromise instances and the
+  // initial Promise.prototype, as well as the  Symbol.species lookup on
+  // the Promise constructor.
+  if (!isolate()->IsSpeciesLookupChainIntact()) return NoChange();
+
+  // Check if we know something about {receiver} already.
+  ZoneHandleSet<Map> receiver_maps;
+  NodeProperties::InferReceiverMapsResult infer_receiver_maps_result =
+      NodeProperties::InferReceiverMaps(receiver, effect, &receiver_maps);
+  if (infer_receiver_maps_result == NodeProperties::kNoReceiverMaps) {
+    return NoChange();
+  }
+  DCHECK_NE(0, receiver_maps.size());
+
+  // Check whether all {receiver_maps} are JSPromise maps and
+  // have the initial Promise.prototype as their [[Prototype]].
+  for (Handle<Map> receiver_map : receiver_maps) {
+    if (!receiver_map->IsJSPromiseMap()) return NoChange();
+    if (receiver_map->prototype() != native_context()->promise_prototype()) {
+      return NoChange();
+    }
+  }
+
+  // Add a code dependency on the necessary protectors.
+  dependencies()->AssumePropertyCell(factory()->promise_hook_protector());
+  dependencies()->AssumePropertyCell(factory()->species_protector());
+
+  // If the {receiver_maps} aren't reliable, we need to repeat the
+  // map check here, guarded by the CALL_IC.
+  if (infer_receiver_maps_result == NodeProperties::kUnreliableReceiverMaps) {
+    effect =
+        graph()->NewNode(simplified()->CheckMaps(CheckMapsFlag::kNone,
+                                                 receiver_maps, p.feedback()),
+                         receiver, effect, control);
+  }
+
+  // Check that {on_fulfilled} is callable.
+  on_fulfilled = graph()->NewNode(
+      common()->Select(MachineRepresentation::kTagged, BranchHint::kTrue),
+      graph()->NewNode(simplified()->ObjectIsCallable(), on_fulfilled),
+      on_fulfilled, jsgraph()->UndefinedConstant());
+
+  // Check that {on_rejected} is callable.
+  on_rejected = graph()->NewNode(
+      common()->Select(MachineRepresentation::kTagged, BranchHint::kTrue),
+      graph()->NewNode(simplified()->ObjectIsCallable(), on_rejected),
+      on_rejected, jsgraph()->UndefinedConstant());
+
+  // Create the resulting JSPromise.
+  Node* result = effect =
+      graph()->NewNode(javascript()->CreatePromise(), context, effect);
+
+  // Chain {result} onto {receiver}.
+  result = effect = graph()->NewNode(javascript()->PerformPromiseThen(),
+                                     receiver, on_fulfilled, on_rejected,
+                                     result, context, effect, control);
+  ReplaceWithValue(node, result, effect, control);
+  return Replace(result);
+}
+
+// ES section #sec-promise.resolve
+Reduction JSCallReducer::ReducePromiseResolveTrampoline(Node* node) {
+  DCHECK_EQ(IrOpcode::kJSCall, node->opcode());
+  Node* receiver = NodeProperties::GetValueInput(node, 1);
+  Node* value = node->op()->ValueInputCount() > 2
+                    ? NodeProperties::GetValueInput(node, 2)
+                    : jsgraph()->UndefinedConstant();
+  Node* context = NodeProperties::GetContextInput(node);
+  Node* frame_state = NodeProperties::GetFrameStateInput(node);
+  Node* effect = NodeProperties::GetEffectInput(node);
+  Node* control = NodeProperties::GetControlInput(node);
+
+  // Check if we know something about {receiver} already.
+  ZoneHandleSet<Map> receiver_maps;
+  NodeProperties::InferReceiverMapsResult infer_receiver_maps_result =
+      NodeProperties::InferReceiverMaps(receiver, effect, &receiver_maps);
+  if (infer_receiver_maps_result == NodeProperties::kNoReceiverMaps) {
+    return NoChange();
+  }
+  DCHECK_NE(0, receiver_maps.size());
+
+  // Only reduce when all {receiver_maps} are JSReceiver maps.
+  for (Handle<Map> receiver_map : receiver_maps) {
+    if (!receiver_map->IsJSReceiverMap()) return NoChange();
+  }
+
+  // Morph the {node} into a JSPromiseResolve operation.
+  node->ReplaceInput(0, receiver);
+  node->ReplaceInput(1, value);
+  node->ReplaceInput(2, context);
+  node->ReplaceInput(3, frame_state);
+  node->ReplaceInput(4, effect);
+  node->ReplaceInput(5, control);
+  node->TrimInputCount(6);
+  NodeProperties::ChangeOp(node, javascript()->PromiseResolve());
   return Changed(node);
 }
 

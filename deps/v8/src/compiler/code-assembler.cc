@@ -58,6 +58,8 @@ CodeAssemblerState::CodeAssemblerState(
     Isolate* isolate, Zone* zone, const CallInterfaceDescriptor& descriptor,
     Code::Kind kind, const char* name, size_t result_size, uint32_t stub_key,
     int32_t builtin_index)
+    // TODO(rmcilroy): Should we use Linkage::GetBytecodeDispatchDescriptor for
+    // bytecode handlers?
     : CodeAssemblerState(
           isolate, zone,
           Linkage::GetStubCallDescriptor(
@@ -245,7 +247,12 @@ TNode<IntPtrT> CodeAssembler::IntPtrConstant(intptr_t value) {
 }
 
 TNode<Number> CodeAssembler::NumberConstant(double value) {
-  return UncheckedCast<Number>(raw_assembler()->NumberConstant(value));
+  int smi_value;
+  if (DoubleToSmiInteger(value, &smi_value)) {
+    return UncheckedCast<Number>(SmiConstant(smi_value));
+  } else {
+    return UncheckedCast<Number>(raw_assembler()->NumberConstant(value));
+  }
 }
 
 TNode<Smi> CodeAssembler::SmiConstant(Smi* value) {
@@ -333,10 +340,10 @@ Node* CodeAssembler::Parameter(int value) {
 }
 
 TNode<Context> CodeAssembler::GetJSContextParameter() {
-  CallDescriptor* desc = raw_assembler()->call_descriptor();
-  DCHECK(desc->IsJSFunctionCall());
+  auto call_descriptor = raw_assembler()->call_descriptor();
+  DCHECK(call_descriptor->IsJSFunctionCall());
   return CAST(Parameter(Linkage::GetJSCallContextParamIndex(
-      static_cast<int>(desc->JSParameterCount()))));
+      static_cast<int>(call_descriptor->JSParameterCount()))));
 }
 
 void CodeAssembler::Return(SloppyTNode<Object> value) {
@@ -415,6 +422,10 @@ Node* CodeAssembler::LoadParentFramePointer() {
 
 Node* CodeAssembler::LoadStackPointer() {
   return raw_assembler()->LoadStackPointer();
+}
+
+Node* CodeAssembler::SpeculationPoison() {
+  return raw_assembler()->SpeculationPoison();
 }
 
 #define DEFINE_CODE_ASSEMBLER_BINARY_OP(name, ResType, Arg1Type, Arg2Type) \
@@ -945,12 +956,12 @@ Node* CodeAssembler::Projection(int index, Node* value) {
 
 void CodeAssembler::GotoIfException(Node* node, Label* if_exception,
                                     Variable* exception_var) {
-  DCHECK(!node->op()->HasProperty(Operator::kNoThrow));
-
   if (if_exception == nullptr) {
     // If no handler is supplied, don't add continuations
     return;
   }
+
+  DCHECK(!node->op()->HasProperty(Operator::kNoThrow));
 
   Label success(this), exception(this, Label::kDeferred);
   success.MergeVariables();
@@ -974,10 +985,10 @@ TNode<Object> CodeAssembler::CallRuntimeImpl(Runtime::FunctionId function,
                                              SloppyTNode<Object> context,
                                              TArgs... args) {
   int argc = static_cast<int>(sizeof...(args));
-  CallDescriptor* desc = Linkage::GetRuntimeCallDescriptor(
+  auto call_descriptor = Linkage::GetRuntimeCallDescriptor(
       zone(), function, argc, Operator::kNoProperties,
       CallDescriptor::kNoFlags);
-  int return_count = static_cast<int>(desc->ReturnCount());
+  int return_count = static_cast<int>(call_descriptor->ReturnCount());
 
   Node* centry =
       HeapConstant(CodeFactory::RuntimeCEntry(isolate(), return_count));
@@ -987,7 +998,8 @@ TNode<Object> CodeAssembler::CallRuntimeImpl(Runtime::FunctionId function,
   Node* nodes[] = {centry, args..., ref, arity, context};
 
   CallPrologue();
-  Node* return_value = raw_assembler()->CallN(desc, arraysize(nodes), nodes);
+  Node* return_value =
+      raw_assembler()->CallN(call_descriptor, arraysize(nodes), nodes);
   CallEpilogue();
   return UncheckedCast<Object>(return_value);
 }
@@ -1004,10 +1016,10 @@ TNode<Object> CodeAssembler::TailCallRuntimeImpl(Runtime::FunctionId function,
                                                  SloppyTNode<Object> context,
                                                  TArgs... args) {
   int argc = static_cast<int>(sizeof...(args));
-  CallDescriptor* desc = Linkage::GetRuntimeCallDescriptor(
+  auto call_descriptor = Linkage::GetRuntimeCallDescriptor(
       zone(), function, argc, Operator::kNoProperties,
       CallDescriptor::kNoFlags);
-  int return_count = static_cast<int>(desc->ReturnCount());
+  int return_count = static_cast<int>(call_descriptor->ReturnCount());
 
   Node* centry =
       HeapConstant(CodeFactory::RuntimeCEntry(isolate(), return_count));
@@ -1017,7 +1029,7 @@ TNode<Object> CodeAssembler::TailCallRuntimeImpl(Runtime::FunctionId function,
   Node* nodes[] = {centry, args..., ref, arity, context};
 
   return UncheckedCast<Object>(
-      raw_assembler()->TailCallN(desc, arraysize(nodes), nodes));
+      raw_assembler()->TailCallN(call_descriptor, arraysize(nodes), nodes));
 }
 
 // Instantiate TailCallRuntime() for argument counts used by CSA-generated code
@@ -1056,14 +1068,15 @@ Node* CodeAssembler::CallStubN(const CallInterfaceDescriptor& descriptor,
   // Extra arguments not mentioned in the descriptor are passed on the stack.
   int stack_parameter_count = argc - descriptor.GetRegisterParameterCount();
   DCHECK_LE(descriptor.GetStackParameterCount(), stack_parameter_count);
-  CallDescriptor* desc = Linkage::GetStubCallDescriptor(
+  auto call_descriptor = Linkage::GetStubCallDescriptor(
       isolate(), zone(), descriptor, stack_parameter_count,
       CallDescriptor::kNoFlags, Operator::kNoProperties,
       MachineType::AnyTagged(), result_size,
       pass_context ? Linkage::kPassContext : Linkage::kNoContext);
 
   CallPrologue();
-  Node* return_value = raw_assembler()->CallN(desc, input_count, inputs);
+  Node* return_value =
+      raw_assembler()->CallN(call_descriptor, input_count, inputs);
   CallEpilogue();
   return return_value;
 }
@@ -1074,14 +1087,14 @@ Node* CodeAssembler::TailCallStubImpl(const CallInterfaceDescriptor& descriptor,
                                       TArgs... args) {
   DCHECK_EQ(descriptor.GetParameterCount(), sizeof...(args));
   size_t result_size = 1;
-  CallDescriptor* desc = Linkage::GetStubCallDescriptor(
+  auto call_descriptor = Linkage::GetStubCallDescriptor(
       isolate(), zone(), descriptor, descriptor.GetStackParameterCount(),
       CallDescriptor::kNoFlags, Operator::kNoProperties,
       MachineType::AnyTagged(), result_size);
 
   Node* nodes[] = {target, args..., context};
   CHECK_EQ(descriptor.GetParameterCount() + 2, arraysize(nodes));
-  return raw_assembler()->TailCallN(desc, arraysize(nodes), nodes);
+  return raw_assembler()->TailCallN(call_descriptor, arraysize(nodes), nodes);
 }
 
 // Instantiate TailCallStub() for argument counts used by CSA-generated code
@@ -1100,13 +1113,13 @@ Node* CodeAssembler::TailCallStubThenBytecodeDispatch(
   int stack_parameter_count =
       sizeof...(args) - descriptor.GetRegisterParameterCount();
   DCHECK_LE(descriptor.GetStackParameterCount(), stack_parameter_count);
-  CallDescriptor* desc = Linkage::GetStubCallDescriptor(
+  auto call_descriptor = Linkage::GetStubCallDescriptor(
       isolate(), zone(), descriptor, stack_parameter_count,
       CallDescriptor::kNoFlags, Operator::kNoProperties,
       MachineType::AnyTagged(), 0);
 
   Node* nodes[] = {target, args..., context};
-  return raw_assembler()->TailCallN(desc, arraysize(nodes), nodes);
+  return raw_assembler()->TailCallN(call_descriptor, arraysize(nodes), nodes);
 }
 
 // Instantiate TailCallJSAndBytecodeDispatch() for argument counts used by
@@ -1122,12 +1135,12 @@ template <class... TArgs>
 Node* CodeAssembler::TailCallBytecodeDispatch(
     const CallInterfaceDescriptor& descriptor, Node* target, TArgs... args) {
   DCHECK_EQ(descriptor.GetParameterCount(), sizeof...(args));
-  CallDescriptor* desc = Linkage::GetBytecodeDispatchCallDescriptor(
+  auto call_descriptor = Linkage::GetBytecodeDispatchCallDescriptor(
       isolate(), zone(), descriptor, descriptor.GetStackParameterCount());
 
   Node* nodes[] = {target, args...};
   CHECK_EQ(descriptor.GetParameterCount() + 1, arraysize(nodes));
-  return raw_assembler()->TailCallN(desc, arraysize(nodes), nodes);
+  return raw_assembler()->TailCallN(call_descriptor, arraysize(nodes), nodes);
 }
 
 // Instantiate TailCallBytecodeDispatch() for argument counts used by
@@ -1138,8 +1151,8 @@ template V8_EXPORT_PRIVATE Node* CodeAssembler::TailCallBytecodeDispatch(
 
 Node* CodeAssembler::CallCFunctionN(Signature<MachineType>* signature,
                                     int input_count, Node* const* inputs) {
-  CallDescriptor* desc = Linkage::GetSimplifiedCDescriptor(zone(), signature);
-  return raw_assembler()->CallN(desc, input_count, inputs);
+  auto call_descriptor = Linkage::GetSimplifiedCDescriptor(zone(), signature);
+  return raw_assembler()->CallN(call_descriptor, input_count, inputs);
 }
 
 Node* CodeAssembler::CallCFunction1(MachineType return_type,
@@ -1357,13 +1370,13 @@ Node* CodeAssemblerVariable::value() const {
     str << "#Use of unbound variable:"
         << "#\n    Variable:      " << *this << "#\n    Current Block: ";
     state_->PrintCurrentBlock(str);
-    FATAL(str.str().c_str());
+    FATAL("%s", str.str().c_str());
   }
   if (!state_->InsideBlock()) {
     std::stringstream str;
     str << "#Accessing variable value outside a block:"
         << "#\n    Variable:      " << *this;
-    FATAL(str.str().c_str());
+    FATAL("%s", str.str().c_str());
   }
 #endif  // DEBUG
   return impl_->value_;
@@ -1456,7 +1469,7 @@ void CodeAssemblerLabel::MergeVariables() {
             }
             str << "\n#    Current Block: ";
             state_->PrintCurrentBlock(str);
-            FATAL(str.str().c_str());
+            FATAL("%s", str.str().c_str());
           }
 #endif  // DEBUG
         }
@@ -1472,7 +1485,7 @@ void CodeAssemblerLabel::Bind(AssemblerDebugInfo debug_info) {
     str << "Cannot bind the same label twice:"
         << "\n#    current:  " << debug_info
         << "\n#    previous: " << *label_->block();
-    FATAL(str.str().c_str());
+    FATAL("%s", str.str().c_str());
   }
   state_->raw_assembler_->Bind(label_, debug_info);
   UpdateVariablesAfterBind();
@@ -1524,7 +1537,7 @@ void CodeAssemblerLabel::UpdateVariablesAfterBind() {
           << " vs. found=" << (not_found ? 0 : i->second.size())
           << "\n# Variable:      " << *var_impl
           << "\n# Current Block: " << *label_->block();
-      FATAL(str.str().c_str());
+      FATAL("%s", str.str().c_str());
     }
 #endif  // DEBUG
     Node* phi = state_->raw_assembler_->Phi(
@@ -1588,3 +1601,15 @@ Smi* CheckObjectType(Object* value, Smi* type, String* location) {
 
 }  // namespace internal
 }  // namespace v8
+
+#undef REPEAT_1_TO_2
+#undef REPEAT_1_TO_3
+#undef REPEAT_1_TO_4
+#undef REPEAT_1_TO_5
+#undef REPEAT_1_TO_6
+#undef REPEAT_1_TO_7
+#undef REPEAT_1_TO_8
+#undef REPEAT_1_TO_9
+#undef REPEAT_1_TO_10
+#undef REPEAT_1_TO_11
+#undef REPEAT_1_TO_12

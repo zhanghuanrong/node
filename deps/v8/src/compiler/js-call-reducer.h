@@ -15,6 +15,7 @@ namespace internal {
 // Forward declarations.
 class CompilationDependencies;
 class Factory;
+class VectorSlotPair;
 
 namespace compiler {
 
@@ -24,11 +25,10 @@ class CommonOperatorBuilder;
 class JSGraph;
 class JSOperatorBuilder;
 class SimplifiedOperatorBuilder;
-class VectorSlotPair;
 
 // Performs strength reduction on {JSConstruct} and {JSCall} nodes,
 // which might allow inlining or other optimizations to be performed afterwards.
-class JSCallReducer final : public AdvancedReducer {
+class V8_EXPORT_PRIVATE JSCallReducer final : public AdvancedReducer {
  public:
   // Flags that control the mode of operation.
   enum Flag { kNoFlags = 0u, kBailoutOnUninitialized = 1u << 0 };
@@ -54,8 +54,8 @@ class JSCallReducer final : public AdvancedReducer {
  private:
   Reduction ReduceArrayConstructor(Node* node);
   Reduction ReduceBooleanConstructor(Node* node);
-  Reduction ReduceCallApiFunction(Node* node, Handle<JSFunction> function);
-  Reduction ReduceNumberConstructor(Node* node);
+  Reduction ReduceCallApiFunction(Node* node,
+                                  Handle<SharedFunctionInfo> shared);
   Reduction ReduceFunctionPrototypeApply(Node* node);
   Reduction ReduceFunctionPrototypeBind(Node* node);
   Reduction ReduceFunctionPrototypeCall(Node* node);
@@ -72,9 +72,20 @@ class JSCallReducer final : public AdvancedReducer {
   Reduction ReduceReflectGet(Node* node);
   Reduction ReduceReflectGetPrototypeOf(Node* node);
   Reduction ReduceReflectHas(Node* node);
-  Reduction ReduceArrayForEach(Handle<JSFunction> function, Node* node);
-  Reduction ReduceArrayMap(Handle<JSFunction> function, Node* node);
-  Reduction ReduceArrayFilter(Handle<JSFunction> function, Node* node);
+  Reduction ReduceArrayForEach(Node* node, Handle<SharedFunctionInfo> shared);
+  enum class ArrayReduceDirection { kLeft, kRight };
+  Reduction ReduceArrayReduce(Node* node, ArrayReduceDirection direction,
+                              Handle<SharedFunctionInfo> shared);
+  Reduction ReduceArrayMap(Node* node, Handle<SharedFunctionInfo> shared);
+  Reduction ReduceArrayFilter(Node* node, Handle<SharedFunctionInfo> shared);
+  enum class ArrayFindVariant { kFind, kFindIndex };
+  Reduction ReduceArrayFind(Node* node, ArrayFindVariant variant,
+                            Handle<SharedFunctionInfo> shared);
+  Reduction ReduceArrayEvery(Node* node, Handle<SharedFunctionInfo> shared);
+  Reduction ReduceArraySome(Node* node, Handle<SharedFunctionInfo> shared);
+  Reduction ReduceArrayPrototypePush(Node* node);
+  Reduction ReduceArrayPrototypePop(Node* node);
+  Reduction ReduceArrayPrototypeShift(Node* node);
   Reduction ReduceCallOrConstructWithArrayLikeOrSpread(
       Node* node, int arity, CallFrequency const& frequency,
       VectorSlotPair const& feedback);
@@ -82,9 +93,25 @@ class JSCallReducer final : public AdvancedReducer {
   Reduction ReduceJSConstructWithArrayLike(Node* node);
   Reduction ReduceJSConstructWithSpread(Node* node);
   Reduction ReduceJSCall(Node* node);
+  Reduction ReduceJSCall(Node* node, Handle<SharedFunctionInfo> shared);
   Reduction ReduceJSCallWithArrayLike(Node* node);
   Reduction ReduceJSCallWithSpread(Node* node);
   Reduction ReduceReturnReceiver(Node* node);
+  Reduction ReduceStringPrototypeIndexOf(Node* node);
+  Reduction ReduceStringPrototypeStringAt(
+      const Operator* string_access_operator, Node* node);
+  Reduction ReduceAsyncFunctionPromiseCreate(Node* node);
+  Reduction ReduceAsyncFunctionPromiseRelease(Node* node);
+  Reduction ReducePromiseCapabilityDefaultReject(Node* node);
+  Reduction ReducePromiseCapabilityDefaultResolve(Node* node);
+  Reduction ReducePromiseConstructor(Node* node);
+  Reduction ReducePromiseInternalConstructor(Node* node);
+  Reduction ReducePromiseInternalReject(Node* node);
+  Reduction ReducePromiseInternalResolve(Node* node);
+  Reduction ReducePromisePrototypeCatch(Node* node);
+  Reduction ReducePromisePrototypeFinally(Node* node);
+  Reduction ReducePromisePrototypeThen(Node* node);
+  Reduction ReducePromiseResolveTrampoline(Node* node);
 
   Reduction ReduceSoftDeoptimize(Node* node, DeoptimizeReason reason);
 
@@ -107,10 +134,20 @@ class JSCallReducer final : public AdvancedReducer {
                                         Node* effect, Node** check_fail,
                                         Node** control);
 
+  // Begin the central loop of a higher-order array builtin. A Loop is wired
+  // into {control}, an EffectPhi into {effect}, and the array index {k} is
+  // threaded into a Phi, which is returned. It's helpful to save the
+  // value of {control} as the loop node, and of {effect} as the corresponding
+  // EffectPhi after function return.
+  Node* WireInLoopStart(Node* k, Node** control, Node** effect);
+  void WireInLoopEnd(Node* loop, Node* eloop, Node* vloop, Node* k,
+                     Node* control, Node* effect);
+
   // Load receiver[k], first bounding k by receiver array length.
   // k is thusly changed, and the effect is changed as well.
   Node* SafeLoadElement(ElementsKind kind, Node* receiver, Node* control,
-                        Node** effect, Node** k);
+                        Node** effect, Node** k,
+                        const VectorSlotPair& feedback);
 
   Graph* graph() const;
   JSGraph* jsgraph() const { return jsgraph_; }

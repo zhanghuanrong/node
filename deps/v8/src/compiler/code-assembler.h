@@ -17,6 +17,7 @@
 #include "src/globals.h"
 #include "src/heap/heap.h"
 #include "src/machine-type.h"
+#include "src/objects/data-handler.h"
 #include "src/runtime/runtime.h"
 #include "src/zone/zone-containers.h"
 
@@ -26,6 +27,10 @@ namespace internal {
 class Callable;
 class CallInterfaceDescriptor;
 class Isolate;
+class JSCollection;
+class JSWeakCollection;
+class JSWeakMap;
+class JSWeakSet;
 class Factory;
 class Zone;
 
@@ -192,6 +197,7 @@ enum class ObjectType {
 
 class AccessCheckNeeded;
 class ClassBoilerplate;
+class BooleanWrapper;
 class CompilationCacheTable;
 class Constructor;
 class Filler;
@@ -203,8 +209,11 @@ class JSSloppyArgumentsObject;
 class MapCache;
 class MutableHeapNumber;
 class NativeContext;
+class NumberWrapper;
+class ScriptWrapper;
 class SloppyArgumentsElements;
 class StringWrapper;
+class SymbolWrapper;
 class Undetectable;
 class UniqueName;
 class WasmMemoryObject;
@@ -252,7 +261,7 @@ class Node;
 class RawMachineAssembler;
 class RawMachineLabel;
 
-typedef ZoneList<CodeAssemblerVariable*> CodeAssemblerVariableList;
+typedef ZoneVector<CodeAssemblerVariable*> CodeAssemblerVariableList;
 
 typedef std::function<void()> CodeAssemblerCallback;
 
@@ -399,6 +408,7 @@ class SloppyTNode : public TNode<T> {
   V(IntPtrEqual, BoolT, WordT, WordT)                     \
   V(Uint32LessThan, BoolT, Word32T, Word32T)              \
   V(Uint32LessThanOrEqual, BoolT, Word32T, Word32T)       \
+  V(Uint32GreaterThan, BoolT, Word32T, Word32T)           \
   V(Uint32GreaterThanOrEqual, BoolT, Word32T, Word32T)    \
   V(UintPtrLessThan, BoolT, WordT, WordT)                 \
   V(UintPtrLessThanOrEqual, BoolT, WordT, WordT)          \
@@ -486,6 +496,7 @@ TNode<Float64T> Float64Add(TNode<Float64T> a, TNode<Float64T> b);
   V(Float64RoundTruncate, Float64T, Float64T)                  \
   V(Word32Clz, Int32T, Word32T)                                \
   V(Word32Not, Word32T, Word32T)                               \
+  V(WordNot, WordT, WordT)                                     \
   V(Int32AbsWithOverflow, PAIR_TYPE(Int32T, BoolT), Int32T)    \
   V(Int64AbsWithOverflow, PAIR_TYPE(Int64T, BoolT), Int64T)    \
   V(IntPtrAbsWithOverflow, PAIR_TYPE(IntPtrT, BoolT), IntPtrT) \
@@ -646,6 +657,12 @@ class V8_EXPORT_PRIVATE CodeAssembler {
   TNode<ExternalReference> ExternalConstant(ExternalReference address);
   TNode<Float64T> Float64Constant(double value);
   TNode<HeapNumber> NaNConstant();
+  TNode<BoolT> Int32TrueConstant() {
+    return ReinterpretCast<BoolT>(Int32Constant(1));
+  }
+  TNode<BoolT> Int32FalseConstant() {
+    return ReinterpretCast<BoolT>(Int32Constant(0));
+  }
 
   bool ToInt32Constant(Node* node, int32_t& out_value);
   bool ToInt64Constant(Node* node, int64_t& out_value);
@@ -696,6 +713,9 @@ class V8_EXPORT_PRIVATE CodeAssembler {
 
   // Access to the stack pointer
   Node* LoadStackPointer();
+
+  // Poison mask for speculation.
+  Node* SpeculationPoison();
 
   // Load raw memory location.
   Node* Load(MachineType rep, Node* base);
@@ -1062,6 +1082,11 @@ class V8_EXPORT_PRIVATE CodeAssembler {
   bool Word32ShiftIsSafe() const;
 
  private:
+  // These two don't have definitions and are here only for catching use cases
+  // where the cast is not necessary.
+  TNode<Int32T> Signed(TNode<Int32T> x);
+  TNode<Uint32T> Unsigned(TNode<Uint32T> x);
+
   RawMachineAssembler* raw_assembler() const;
 
   // Calls respective callback registered in the state.
@@ -1126,23 +1151,17 @@ class TypedCodeAssemblerVariable : public CodeAssemblerVariable {
                               initial_value) {}
 #endif  // DEBUG
 
-  template <class U, class = typename std::enable_if<
-                         std::is_convertible<TNode<T>, TNode<U>>::value>::type>
-  operator TNode<U>() const {
-    return TNode<T>::UncheckedCast(value());
+  TNode<T> value() const {
+    return TNode<T>::UncheckedCast(CodeAssemblerVariable::value());
   }
-  template <class U, class = typename std::enable_if<
-                         std::is_convertible<TNode<T>, TNode<U>>::value>::type>
-  operator SloppyTNode<U>() const {
-    return value();
-  }
-  operator Node*() const { return value(); }
 
   void operator=(TNode<T> value) { Bind(value); }
+  void operator=(const TypedCodeAssemblerVariable<T>& variable) {
+    Bind(variable.value());
+  }
 
  private:
   using CodeAssemblerVariable::Bind;
-  using CodeAssemblerVariable::value;
 };
 
 class CodeAssemblerLabel {
@@ -1157,7 +1176,7 @@ class CodeAssemblerLabel {
       CodeAssembler* assembler,
       const CodeAssemblerVariableList& merged_variables,
       CodeAssemblerLabel::Type type = CodeAssemblerLabel::kNonDeferred)
-      : CodeAssemblerLabel(assembler, merged_variables.length(),
+      : CodeAssemblerLabel(assembler, merged_variables.size(),
                            &(merged_variables[0]), type) {}
   CodeAssemblerLabel(
       CodeAssembler* assembler, size_t count,

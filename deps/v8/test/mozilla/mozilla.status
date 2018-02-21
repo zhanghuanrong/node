@@ -118,6 +118,10 @@
   # Invalid according to ES2015 syntax. (Details: crbug.com/726625)
   'ecma_3/extensions/regress-368516': [FAIL],
 
+  # Function.prototype.toString revision.
+  # (https://chromium-review.googlesource.com/c/546941#message-5dc0f5efe277388501e8870e39ec70383dfc7db8)
+  'js1_5/Scope/regress-185485': [FAIL],
+
   ##################### SKIPPED TESTS #####################
 
   # This test checks that we behave properly in an out-of-memory
@@ -154,7 +158,7 @@
 
   # Compiles a long chain of && or || operations, can time out under slower
   # variants.
-  'js1_5/Expressions/regress-394673': [PASS, FAST_VARIANTS],
+  'js1_5/Expressions/regress-394673': [PASS, NO_VARIANTS],
 
   # This takes a long time to run (~100 seconds). It should only be run
   # by the really patient.
@@ -879,10 +883,10 @@
 
 ['no_i18n == True and mode == debug', {
   # Tests too slow for no18n debug.
-  'ecma_3/Statements/regress-302439': [PASS, FAST_VARIANTS],
+  'ecma_3/Statements/regress-302439': [PASS, NO_VARIANTS],
   'js1_5/Regress/regress-98901': [SKIP],
-  'ecma_3/RegExp/perlstress-001': [PASS, FAST_VARIANTS],
-  'js1_5/extensions/regress-311161': [FAIL_OK, FAST_VARIANTS],
+  'ecma_3/RegExp/perlstress-001': [PASS, NO_VARIANTS],
+  'js1_5/extensions/regress-311161': [FAIL_OK, NO_VARIANTS],
 }],  # 'no_i18n == True and mode == debug'
 
 

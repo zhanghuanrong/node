@@ -57,6 +57,8 @@ static const char kDebuggerNotPaused[] =
 static const size_t kBreakpointHintMaxLength = 128;
 static const intptr_t kBreakpointHintMaxSearchOffset = 80 * 10;
 
+static const int kMaxScriptFailedToParseScripts = 1000;
+
 namespace {
 
 void TranslateLocation(protocol::Debugger::Location* location,
@@ -553,7 +555,7 @@ Response V8DebuggerAgentImpl::setBreakpointByUrl(
     }
     std::unique_ptr<protocol::Debugger::Location> location = setBreakpointImpl(
         breakpointId, script.first, condition, lineNumber, columnNumber);
-    if (type != BreakpointType::kByUrlRegex) {
+    if (location && type != BreakpointType::kByUrlRegex) {
       hint = breakpointHint(*script.second, lineNumber, columnNumber);
     }
     if (location) (*locations)->addItem(std::move(location));
@@ -1330,6 +1332,24 @@ V8DebuggerAgentImpl::currentExternalStackTrace() {
       .build();
 }
 
+std::unique_ptr<protocol::Runtime::StackTraceId>
+V8DebuggerAgentImpl::currentScheduledAsyncCall() {
+  v8_inspector::V8StackTraceId scheduledAsyncCall =
+      m_debugger->scheduledAsyncCall();
+  if (scheduledAsyncCall.IsInvalid()) return nullptr;
+  std::unique_ptr<protocol::Runtime::StackTraceId> asyncCallStackTrace =
+      protocol::Runtime::StackTraceId::create()
+          .setId(stackTraceIdToString(scheduledAsyncCall.id))
+          .build();
+  // TODO(kozyatinskiy): extract this check to IsLocal function.
+  if (scheduledAsyncCall.debugger_id.first ||
+      scheduledAsyncCall.debugger_id.second) {
+    asyncCallStackTrace->setDebuggerId(
+        debuggerIdToString(scheduledAsyncCall.debugger_id));
+  }
+  return asyncCallStackTrace;
+}
+
 bool V8DebuggerAgentImpl::isPaused() const {
   return m_debugger->isPausedInContextGroup(m_session->contextGroupId());
 }
@@ -1398,7 +1418,13 @@ void V8DebuggerAgentImpl::didParseSource(
         static_cast<int>(scriptRef->source().length()), std::move(stackTrace));
   }
 
-  if (!success) return;
+  if (!success) {
+    if (scriptURL.isEmpty()) {
+      m_failedToParseAnonymousScriptIds.push_back(scriptId);
+      cleanupOldFailedToParseAnonymousScriptsIfNeeded();
+    }
+    return;
+  }
 
   std::vector<protocol::DictionaryValue*> potentialBreakpoints;
   if (!scriptURL.isEmpty()) {
@@ -1532,22 +1558,10 @@ void V8DebuggerAgentImpl::didPause(
   Response response = currentCallFrames(&protocolCallFrames);
   if (!response.isSuccess()) protocolCallFrames = Array<CallFrame>::create();
 
-  Maybe<protocol::Runtime::StackTraceId> asyncCallStackTrace;
-  void* rawScheduledAsyncTask = m_debugger->scheduledAsyncTask();
-  if (rawScheduledAsyncTask) {
-    asyncCallStackTrace =
-        protocol::Runtime::StackTraceId::create()
-            .setId(stackTraceIdToString(
-                reinterpret_cast<uintptr_t>(rawScheduledAsyncTask)))
-            .setDebuggerId(debuggerIdToString(
-                m_debugger->debuggerIdFor(m_session->contextGroupId())))
-            .build();
-  }
-
   m_frontend.paused(std::move(protocolCallFrames), breakReason,
                     std::move(breakAuxData), std::move(hitBreakpointIds),
                     currentAsyncStackTrace(), currentExternalStackTrace(),
-                    std::move(asyncCallStackTrace));
+                    currentScheduledAsyncCall());
 }
 
 void V8DebuggerAgentImpl::didContinue() {
@@ -1610,6 +1624,20 @@ void V8DebuggerAgentImpl::reset() {
   resetBlackboxedStateCache();
   m_scripts.clear();
   m_breakpointIdToDebuggerBreakpointIds.clear();
+}
+
+void V8DebuggerAgentImpl::cleanupOldFailedToParseAnonymousScriptsIfNeeded() {
+  if (m_failedToParseAnonymousScriptIds.size() <=
+      kMaxScriptFailedToParseScripts)
+    return;
+  static_assert(kMaxScriptFailedToParseScripts > 100,
+                "kMaxScriptFailedToParseScripts should be greater then 100");
+  while (m_failedToParseAnonymousScriptIds.size() >
+         kMaxScriptFailedToParseScripts - 100 + 1) {
+    String16 scriptId = m_failedToParseAnonymousScriptIds.front();
+    m_failedToParseAnonymousScriptIds.pop_front();
+    m_scripts.erase(scriptId);
+  }
 }
 
 }  // namespace v8_inspector

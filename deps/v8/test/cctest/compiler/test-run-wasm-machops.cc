@@ -32,14 +32,12 @@ static void UpdateFunctionTableSizeReferences(Handle<Code> code,
   for (RelocIterator it(*code, mode_mask); !it.done(); it.next()) {
     RelocInfo::Mode mode = it.rinfo()->rmode();
     if (RelocInfo::IsWasmFunctionTableSizeReference(mode)) {
-      it.rinfo()->update_wasm_function_table_size_reference(isolate, old_size,
-                                                            new_size);
+      it.rinfo()->update_wasm_function_table_size_reference(old_size, new_size);
       modified = true;
     }
   }
   if (modified) {
-    Assembler::FlushICache(isolate, code->instruction_start(),
-                           code->instruction_size());
+    Assembler::FlushICache(code->instruction_start(), code->instruction_size());
   }
 }
 
@@ -164,14 +162,14 @@ TEST(Uint32LessThanMemoryRelocation) {
   Node* cond = m.AddNode(m.machine()->Uint32LessThan(), index, limit);
   m.Branch(cond, &within_bounds, &out_of_bounds);
   m.Bind(&within_bounds);
-  m.Return(m.Int32Constant(0xaced));
+  m.Return(m.Int32Constant(0xACED));
   m.Bind(&out_of_bounds);
-  m.Return(m.Int32Constant(0xdeadbeef));
+  m.Return(m.Int32Constant(0xDEADBEEF));
   // Check that index is out of bounds with current size
-  CHECK_EQ(0xdeadbeef, m.Call());
+  CHECK_EQ(0xDEADBEEF, m.Call());
   wasm_context.SetRawMemory(wasm_context.mem_start, 0x400);
   // Check that after limit is increased, index is within bounds.
-  CHECK_EQ(0xacedu, m.Call());
+  CHECK_EQ(0xACEDu, m.Call());
 }
 
 TEST(Uint32LessThanFunctionTableRelocation) {
@@ -183,17 +181,17 @@ TEST(Uint32LessThanFunctionTableRelocation) {
   Node* cond = m.AddNode(m.machine()->Uint32LessThan(), index, limit);
   m.Branch(cond, &within_bounds, &out_of_bounds);
   m.Bind(&within_bounds);
-  m.Return(m.Int32Constant(0xaced));
+  m.Return(m.Int32Constant(0xACED));
   m.Bind(&out_of_bounds);
-  m.Return(m.Int32Constant(0xdeadbeef));
+  m.Return(m.Int32Constant(0xDEADBEEF));
   // Check that index is out of bounds with current size
-  CHECK_EQ(0xdeadbeef, m.Call());
+  CHECK_EQ(0xDEADBEEF, m.Call());
   m.GenerateCode();
 
   Handle<Code> code = m.GetCode();
   UpdateFunctionTableSizeReferences(code, 0x200, 0x400);
   // Check that after limit is increased, index is within bounds.
-  CHECK_EQ(0xaced, m.Call());
+  CHECK_EQ(0xACED, m.Call());
 }
 
 }  // namespace compiler

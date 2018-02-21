@@ -90,6 +90,7 @@ class V8_EXPORT_PRIVATE EffectControlLinearizer {
   Node* LowerTruncateTaggedToWord32(Node* node);
   Node* LowerCheckedTruncateTaggedToWord32(Node* node, Node* frame_state);
   Node* LowerAllocate(Node* node);
+  Node* LowerNumberToString(Node* node);
   Node* LowerObjectIsArrayBufferView(Node* node);
   Node* LowerObjectIsBigInt(Node* node);
   Node* LowerObjectIsCallable(Node* node);
@@ -104,22 +105,28 @@ class V8_EXPORT_PRIVATE EffectControlLinearizer {
   Node* LowerObjectIsString(Node* node);
   Node* LowerObjectIsSymbol(Node* node);
   Node* LowerObjectIsUndetectable(Node* node);
+  Node* LowerNumberIsFloat64Hole(Node* node);
   Node* LowerArgumentsFrame(Node* node);
   Node* LowerArgumentsLength(Node* node);
   Node* LowerNewDoubleElements(Node* node);
   Node* LowerNewSmiOrObjectElements(Node* node);
   Node* LowerNewArgumentsElements(Node* node);
+  Node* LowerNewConsString(Node* node);
   Node* LowerArrayBufferWasNeutered(Node* node);
   Node* LowerSameValue(Node* node);
+  Node* LowerDeadValue(Node* node);
   Node* LowerStringToNumber(Node* node);
   Node* LowerStringCharAt(Node* node);
   Node* LowerStringCharCodeAt(Node* node);
   Node* LowerSeqStringCharCodeAt(Node* node);
+  Node* LowerStringCodePointAt(Node* node, UnicodeEncoding encoding);
+  Node* LowerSeqStringCodePointAt(Node* node, UnicodeEncoding encoding);
   Node* LowerStringToLowerCaseIntl(Node* node);
   Node* LowerStringToUpperCaseIntl(Node* node);
   Node* LowerStringFromCharCode(Node* node);
   Node* LowerStringFromCodePoint(Node* node);
   Node* LowerStringIndexOf(Node* node);
+  Node* LowerStringLength(Node* node);
   Node* LowerStringEqual(Node* node);
   Node* LowerStringLessThan(Node* node);
   Node* LowerStringLessThanOrEqual(Node* node);
@@ -129,7 +136,6 @@ class V8_EXPORT_PRIVATE EffectControlLinearizer {
   void LowerCheckEqualsInternalizedString(Node* node, Node* frame_state);
   void LowerCheckEqualsSymbol(Node* node, Node* frame_state);
   Node* LowerTypeOf(Node* node);
-  Node* LowerClassOf(Node* node);
   Node* LowerToBoolean(Node* node);
   Node* LowerPlainPrimitiveToNumber(Node* node);
   Node* LowerPlainPrimitiveToWord32(Node* node);
@@ -156,9 +162,11 @@ class V8_EXPORT_PRIVATE EffectControlLinearizer {
   Maybe<Node*> LowerFloat64RoundTruncate(Node* node);
 
   Node* AllocateHeapNumberWithValue(Node* node);
-  Node* BuildCheckedFloat64ToInt32(CheckForMinusZeroMode mode, Node* value,
+  Node* BuildCheckedFloat64ToInt32(CheckForMinusZeroMode mode,
+                                   const VectorSlotPair& feedback, Node* value,
                                    Node* frame_state);
   Node* BuildCheckedHeapNumberOrOddballToFloat64(CheckTaggedInputMode mode,
+                                                 const VectorSlotPair& feedback,
                                                  Node* value,
                                                  Node* frame_state);
   Node* BuildFloat64RoundDown(Node* value);
@@ -167,12 +175,14 @@ class V8_EXPORT_PRIVATE EffectControlLinearizer {
   Node* IsElementsKindGreaterThan(Node* kind, ElementsKind reference_kind);
 
   Node* ChangeInt32ToSmi(Node* value);
+  Node* ChangeInt32ToIntPtr(Node* value);
   Node* ChangeIntPtrToInt32(Node* value);
   Node* ChangeUint32ToUintPtr(Node* value);
   Node* ChangeUint32ToSmi(Node* value);
   Node* ChangeSmiToIntPtr(Node* value);
   Node* ChangeSmiToInt32(Node* value);
   Node* ObjectIsSmi(Node* value);
+  Node* LoadFromSeqString(Node* receiver, Node* position, Node* is_one_byte);
 
   Node* SmiMaxValueConstant();
   Node* SmiShiftBitsConstant();

@@ -153,20 +153,6 @@ void Scavenger::Process(OneshotBarrier* barrier) {
   } while (!done);
 }
 
-void Scavenger::RecordCopiedObject(HeapObject* obj) {
-  bool should_record = FLAG_log_gc;
-#ifdef DEBUG
-  should_record = FLAG_heap_stats;
-#endif
-  if (should_record) {
-    if (heap()->new_space()->Contains(obj)) {
-      heap()->new_space()->RecordAllocation(obj);
-    } else {
-      heap()->new_space()->RecordPromotion(obj);
-    }
-  }
-}
-
 void Scavenger::Finalize() {
   heap()->MergeAllocationSitePretenuringFeedback(local_pretenuring_feedback_);
   heap()->IncrementSemiSpaceCopiedObjectSize(copied_size_);
@@ -174,12 +160,13 @@ void Scavenger::Finalize() {
   allocator_.Finalize();
 }
 
-void RootScavengeVisitor::VisitRootPointer(Root root, Object** p) {
+void RootScavengeVisitor::VisitRootPointer(Root root, const char* description,
+                                           Object** p) {
   ScavengePointer(p);
 }
 
-void RootScavengeVisitor::VisitRootPointers(Root root, Object** start,
-                                            Object** end) {
+void RootScavengeVisitor::VisitRootPointers(Root root, const char* description,
+                                            Object** start, Object** end) {
   // Copy all HeapObject pointers in [start, end)
   for (Object** p = start; p < end; p++) ScavengePointer(p);
 }

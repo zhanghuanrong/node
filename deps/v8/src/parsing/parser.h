@@ -14,7 +14,6 @@
 #include "src/globals.h"
 #include "src/parsing/parser-base.h"
 #include "src/parsing/parsing.h"
-#include "src/parsing/preparse-data-format.h"
 #include "src/parsing/preparse-data.h"
 #include "src/parsing/preparser.h"
 #include "src/utils.h"
@@ -27,7 +26,6 @@ namespace internal {
 
 class ConsumedPreParsedScopeData;
 class ParseInfo;
-class ScriptData;
 class ParserTarget;
 class ParserTargetScope;
 class PendingCompilationErrorHandler;
@@ -76,47 +74,6 @@ class FunctionEntry BASE_EMBEDDED {
   Vector<unsigned> backing_;
 };
 
-
-// Wrapper around ScriptData to provide parser-specific functionality.
-class ParseData {
- public:
-  static ParseData* FromCachedData(ScriptData* cached_data) {
-    ParseData* pd = new ParseData(cached_data);
-    if (pd->IsSane()) return pd;
-    cached_data->Reject();
-    delete pd;
-    return nullptr;
-  }
-
-  void Initialize();
-  FunctionEntry GetFunctionEntry(int start);
-  int FunctionCount();
-
-  unsigned* Data() {  // Writable data as unsigned int array.
-    return reinterpret_cast<unsigned*>(const_cast<byte*>(script_data_->data()));
-  }
-
-  void Reject() { script_data_->Reject(); }
-
-  bool rejected() const { return script_data_->rejected(); }
-
- private:
-  explicit ParseData(ScriptData* script_data) : script_data_(script_data) {}
-
-  bool IsSane();
-  unsigned Magic();
-  unsigned Version();
-  int FunctionsSize();
-  int Length() const {
-    // Script data length is already checked to be a multiple of unsigned size.
-    return script_data_->length() / sizeof(unsigned);
-  }
-
-  ScriptData* script_data_;
-  int function_index_;
-
-  DISALLOW_COPY_AND_ASSIGN(ParseData);
-};
 
 // ----------------------------------------------------------------------------
 // JAVASCRIPT PARSING
@@ -192,8 +149,6 @@ class V8_EXPORT_PRIVATE Parser : public NON_EXPORTED_BASE(ParserBase<Parser>) {
   ~Parser() {
     delete reusable_preparser_;
     reusable_preparser_ = nullptr;
-    delete cached_parse_data_;
-    cached_parse_data_ = nullptr;
   }
 
   static bool IsPreParser() { return false; }
@@ -267,19 +222,16 @@ class V8_EXPORT_PRIVATE Parser : public NON_EXPORTED_BASE(ParserBase<Parser>) {
   // Called by ParseProgram after setting up the scanner.
   FunctionLiteral* DoParseProgram(ParseInfo* info);
 
-  void SetCachedData(ParseInfo* info);
+  // Parse with the script as if the source is implicitly wrapped in a function.
+  // We manually construct the AST and scopes for a top-level function and the
+  // function wrapper.
+  void ParseWrapped(ParseInfo* info, ZoneList<Statement*>* body,
+                    DeclarationScope* scope, Zone* zone, bool* ok);
+
+  ZoneList<const AstRawString*>* PrepareWrappedArguments(ParseInfo* info,
+                                                         Zone* zone);
 
   void StitchAst(ParseInfo* top_level_parse_info, Isolate* isolate);
-
-  ScriptCompiler::CompileOptions compile_options() const {
-    return compile_options_;
-  }
-  bool consume_cached_parse_data() const {
-    return compile_options_ == ScriptCompiler::kConsumeParserCache;
-  }
-  bool produce_cached_parse_data() const {
-    return compile_options_ == ScriptCompiler::kProduceParserCache;
-  }
 
   PreParser* reusable_preparser() {
     if (reusable_preparser_ == nullptr) {
@@ -292,10 +244,13 @@ class V8_EXPORT_PRIVATE Parser : public NON_EXPORTED_BASE(ParserBase<Parser>) {
       SET_ALLOW(harmony_do_expressions);
       SET_ALLOW(harmony_function_sent);
       SET_ALLOW(harmony_public_fields);
+      SET_ALLOW(harmony_static_fields);
       SET_ALLOW(harmony_dynamic_import);
       SET_ALLOW(harmony_import_meta);
-      SET_ALLOW(harmony_async_iteration);
       SET_ALLOW(harmony_bigint);
+      SET_ALLOW(harmony_optional_catch_binding);
+      SET_ALLOW(harmony_private_fields);
+      SET_ALLOW(eval_cache);
 #undef SET_ALLOW
     }
     return reusable_preparser_;
@@ -366,6 +321,7 @@ class V8_EXPORT_PRIVATE Parser : public NON_EXPORTED_BASE(ParserBase<Parser>) {
                                       int class_token_pos, bool* ok);
   V8_INLINE void DeclareClassProperty(const AstRawString* class_name,
                                       ClassLiteralProperty* property,
+                                      const AstRawString* property_name,
                                       ClassLiteralProperty::Kind kind,
                                       bool is_static, bool is_constructor,
                                       bool is_computed_name,
@@ -391,13 +347,14 @@ class V8_EXPORT_PRIVATE Parser : public NON_EXPORTED_BASE(ParserBase<Parser>) {
   Expression* RewriteDestructuringAssignment(Assignment* assignment);
 
   // [if (IteratorType == kAsync)]
-  //     !%_IsJSReceiver(result = Await(iterator.next()) &&
+  //     !%_IsJSReceiver(result = Await(next.[[Call]](iterator, « »)) &&
   //         %ThrowIteratorResultNotAnObject(result)
   // [else]
-  //     !%_IsJSReceiver(result = iterator.next()) &&
+  //     !%_IsJSReceiver(result = next.[[Call]](iterator, « »)) &&
   //         %ThrowIteratorResultNotAnObject(result)
   // [endif]
-  Expression* BuildIteratorNextResult(Expression* iterator, Variable* result,
+  Expression* BuildIteratorNextResult(VariableProxy* iterator,
+                                      VariableProxy* next, Variable* result,
                                       IteratorType type, int pos);
 
   // Initialize the components of a for-in / for-of statement.
@@ -425,7 +382,13 @@ class V8_EXPORT_PRIVATE Parser : public NON_EXPORTED_BASE(ParserBase<Parser>) {
       const AstRawString* name, Scanner::Location function_name_location,
       FunctionNameValidity function_name_validity, FunctionKind kind,
       int function_token_position, FunctionLiteral::FunctionType type,
-      LanguageMode language_mode, bool* ok);
+      LanguageMode language_mode,
+      ZoneList<const AstRawString*>* arguments_for_wrapped_function, bool* ok);
+
+  ObjectLiteral* InitializeObjectLiteral(ObjectLiteral* object_literal) {
+    object_literal->CalculateEmitStore(main_zone());
+    return object_literal;
+  }
 
   // Check if the scope has conflicting var/let declarations from different
   // scopes. This covers for example
@@ -488,7 +451,8 @@ class V8_EXPORT_PRIVATE Parser : public NON_EXPORTED_BASE(ParserBase<Parser>) {
       FunctionLiteral::FunctionType function_type,
       DeclarationScope* function_scope, int* num_parameters,
       int* function_length, bool* has_duplicate_parameters,
-      int* expected_property_count, bool* ok);
+      int* expected_property_count, int* suspend_count,
+      ZoneList<const AstRawString*>* arguments_for_wrapped_function, bool* ok);
 
   void ThrowPendingError(Isolate* isolate, Handle<Script> script);
 
@@ -536,7 +500,6 @@ class V8_EXPORT_PRIVATE Parser : public NON_EXPORTED_BASE(ParserBase<Parser>) {
                              Expression* expression);
   Expression* CloseTemplateLiteral(TemplateLiteralState* state, int start,
                                    Expression* tag);
-  int32_t ComputeTemplateLiteralHash(const TemplateLiteral* lit);
 
   ZoneList<Expression*>* PrepareSpreadArguments(ZoneList<Expression*>* list);
   Expression* SpreadCall(Expression* function, ZoneList<Expression*>* args,
@@ -553,13 +516,8 @@ class V8_EXPORT_PRIVATE Parser : public NON_EXPORTED_BASE(ParserBase<Parser>) {
 
   Expression* RewriteSpreads(ArrayLiteral* lit);
 
-  // Rewrite expressions that are not used as patterns
-  V8_INLINE void RewriteNonPattern(bool* ok);
-
   V8_INLINE void QueueDestructuringAssignmentForRewriting(
       RewritableExpression* assignment);
-  V8_INLINE void QueueNonPatternForRewriting(RewritableExpression* expr,
-                                             bool* ok);
 
   friend class InitializerRewriter;
   void RewriteParameterInitializer(Expression* expr);
@@ -760,17 +718,11 @@ class V8_EXPORT_PRIVATE Parser : public NON_EXPORTED_BASE(ParserBase<Parser>) {
   bool CollapseNaryExpression(Expression** x, Expression* y, Token::Value op,
                               int pos, const SourceRange& range);
 
-  // Rewrites the following types of unary expressions:
-  // not <literal> -> true / false
-  // + <numeric literal> -> <numeric literal>
-  // - <numeric literal> -> <numeric literal with value negated>
+  // Returns a UnaryExpression or, in one of the following cases, a Literal.
   // ! <literal> -> true / false
-  // The following rewriting rules enable the collection of type feedback
-  // without any special stub and the multiplication is removed later in
-  // Crankshaft's canonicalization pass.
-  // + foo -> foo * 1
-  // - foo -> foo * (-1)
-  // ~ foo -> foo ^(~0)
+  // + <Number literal> -> <Number literal>
+  // - <Number literal> -> <Number literal with value negated>
+  // ~ <literal> -> true / false
   Expression* BuildUnaryExpression(Expression* expression, Token::Value op,
                                    int pos);
 
@@ -880,7 +832,7 @@ class V8_EXPORT_PRIVATE Parser : public NON_EXPORTED_BASE(ParserBase<Parser>) {
 
   Literal* ExpressionFromLiteral(Token::Value token, int pos);
 
-  V8_INLINE Expression* ExpressionFromIdentifier(
+  V8_INLINE VariableProxy* ExpressionFromIdentifier(
       const AstRawString* name, int start_position,
       InferName infer = InferName::kYes) {
     if (infer == InferName::kYes) {
@@ -988,10 +940,6 @@ class V8_EXPORT_PRIVATE Parser : public NON_EXPORTED_BASE(ParserBase<Parser>) {
   V8_INLINE ZoneList<typename ExpressionClassifier::Error>*
   GetReportedErrorList() const {
     return function_state_->GetReportedErrorList();
-  }
-
-  V8_INLINE ZoneList<RewritableExpression*>* GetNonPatternList() const {
-    return function_state_->non_patterns_to_rewrite();
   }
 
   V8_INLINE void CountUsage(v8::Isolate::UseCounterFeature feature) {
@@ -1140,7 +1088,6 @@ class V8_EXPORT_PRIVATE Parser : public NON_EXPORTED_BASE(ParserBase<Parser>) {
   ParserTarget* target_stack_;  // for break, continue statements
 
   ScriptCompiler::CompileOptions compile_options_;
-  ParseData* cached_parse_data_;
 
   // Other information which will be stored in Parser and moved to Isolate after
   // parsing.
@@ -1148,7 +1095,6 @@ class V8_EXPORT_PRIVATE Parser : public NON_EXPORTED_BASE(ParserBase<Parser>) {
   int total_preparse_skipped_;
   bool allow_lazy_;
   bool temp_zoned_;
-  ParserLogger* log_;
   ConsumedPreParsedScopeData* consumed_preparsed_scope_data_;
 
   // If not kNoSourcePosition, indicates that the first function literal

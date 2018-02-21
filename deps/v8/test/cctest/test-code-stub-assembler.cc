@@ -237,8 +237,8 @@ TEST(DecodeWordFromWord32) {
   CodeStubAssembler m(asm_tester.state());
 
   class TestBitField : public BitField<unsigned, 3, 3> {};
-  m.Return(
-      m.SmiTag(m.DecodeWordFromWord32<TestBitField>(m.Int32Constant(0x2f))));
+  m.Return(m.SmiTag(
+      m.Signed(m.DecodeWordFromWord32<TestBitField>(m.Int32Constant(0x2F)))));
   FunctionTester ft(asm_tester.GenerateCode());
   MaybeHandle<Object> result = ft.Call();
   // value  = 00101111
@@ -914,7 +914,7 @@ TEST(TryHasOwnProperty) {
     JSFunction::EnsureHasInitialMap(function);
     function->initial_map()->set_instance_type(JS_GLOBAL_OBJECT_TYPE);
     function->initial_map()->set_is_prototype_map(true);
-    function->initial_map()->set_dictionary_map(true);
+    function->initial_map()->set_is_dictionary_map(true);
     function->initial_map()->set_may_have_interesting_symbols(true);
     Handle<JSObject> object = factory->NewJSGlobalObject(function);
     AddProperties(object, names, arraysize(names));
@@ -1706,7 +1706,94 @@ TEST(Arguments) {
   CSA_ASSERT(
       &m, m.WordEqual(arguments.AtIndex(2), m.SmiConstant(Smi::FromInt(14))));
 
-  m.Return(arguments.GetReceiver());
+  arguments.PopAndReturn(arguments.GetReceiver());
+
+  FunctionTester ft(asm_tester.GenerateCode(), kNumParams);
+  Handle<Object> result = ft.Call(isolate->factory()->undefined_value(),
+                                  Handle<Smi>(Smi::FromInt(12), isolate),
+                                  Handle<Smi>(Smi::FromInt(13), isolate),
+                                  Handle<Smi>(Smi::FromInt(14), isolate))
+                              .ToHandleChecked();
+  CHECK_EQ(*isolate->factory()->undefined_value(), *result);
+}
+
+TEST(ArgumentsWithSmiConstantIndices) {
+  Isolate* isolate(CcTest::InitIsolateOnce());
+
+  const int kNumParams = 4;
+  CodeAssemblerTester asm_tester(isolate, kNumParams);
+  CodeStubAssembler m(asm_tester.state());
+
+  CodeStubArguments arguments(&m, m.SmiConstant(3), nullptr,
+                              CodeStubAssembler::SMI_PARAMETERS);
+
+  CSA_ASSERT(&m,
+             m.WordEqual(arguments.AtIndex(m.SmiConstant(0),
+                                           CodeStubAssembler::SMI_PARAMETERS),
+                         m.SmiConstant(Smi::FromInt(12))));
+  CSA_ASSERT(&m,
+             m.WordEqual(arguments.AtIndex(m.SmiConstant(1),
+                                           CodeStubAssembler::SMI_PARAMETERS),
+                         m.SmiConstant(Smi::FromInt(13))));
+  CSA_ASSERT(&m,
+             m.WordEqual(arguments.AtIndex(m.SmiConstant(2),
+                                           CodeStubAssembler::SMI_PARAMETERS),
+                         m.SmiConstant(Smi::FromInt(14))));
+
+  arguments.PopAndReturn(arguments.GetReceiver());
+
+  FunctionTester ft(asm_tester.GenerateCode(), kNumParams);
+  Handle<Object> result = ft.Call(isolate->factory()->undefined_value(),
+                                  Handle<Smi>(Smi::FromInt(12), isolate),
+                                  Handle<Smi>(Smi::FromInt(13), isolate),
+                                  Handle<Smi>(Smi::FromInt(14), isolate))
+                              .ToHandleChecked();
+  CHECK_EQ(*isolate->factory()->undefined_value(), *result);
+}
+
+TNode<Smi> NonConstantSmi(CodeStubAssembler* m, int value) {
+  // Generate a SMI with the given value and feed it through a Phi so it can't
+  // be inferred to be constant.
+  Variable var(m, MachineRepresentation::kTagged, m->SmiConstant(value));
+  Label dummy_done(m);
+  // Even though the Goto always executes, it will taint the variable and thus
+  // make it appear non-constant when used later.
+  m->GotoIf(m->Int32Constant(1), &dummy_done);
+  var.Bind(m->SmiConstant(value));
+  m->Goto(&dummy_done);
+  m->BIND(&dummy_done);
+
+  // Ensure that the above hackery actually created a non-constant SMI.
+  Smi* smi_constant;
+  CHECK(!m->ToSmiConstant(var.value(), smi_constant));
+
+  return m->UncheckedCast<Smi>(var.value());
+}
+
+TEST(ArgumentsWithSmiIndices) {
+  Isolate* isolate(CcTest::InitIsolateOnce());
+
+  const int kNumParams = 4;
+  CodeAssemblerTester asm_tester(isolate, kNumParams);
+  CodeStubAssembler m(asm_tester.state());
+
+  CodeStubArguments arguments(&m, m.SmiConstant(3), nullptr,
+                              CodeStubAssembler::SMI_PARAMETERS);
+
+  CSA_ASSERT(&m,
+             m.WordEqual(arguments.AtIndex(NonConstantSmi(&m, 0),
+                                           CodeStubAssembler::SMI_PARAMETERS),
+                         m.SmiConstant(Smi::FromInt(12))));
+  CSA_ASSERT(&m,
+             m.WordEqual(arguments.AtIndex(NonConstantSmi(&m, 1),
+                                           CodeStubAssembler::SMI_PARAMETERS),
+                         m.SmiConstant(Smi::FromInt(13))));
+  CSA_ASSERT(&m,
+             m.WordEqual(arguments.AtIndex(NonConstantSmi(&m, 2),
+                                           CodeStubAssembler::SMI_PARAMETERS),
+                         m.SmiConstant(Smi::FromInt(14))));
+
+  arguments.PopAndReturn(arguments.GetReceiver());
 
   FunctionTester ft(asm_tester.GenerateCode(), kNumParams);
   Handle<Object> result = ft.Call(isolate->factory()->undefined_value(),
@@ -1734,7 +1821,7 @@ TEST(ArgumentsForEach) {
   arguments.ForEach(
       list, [&m, &sum](Node* arg) { sum.Bind(m.SmiAdd(sum.value(), arg)); });
 
-  m.Return(sum.value());
+  arguments.PopAndReturn(sum.value());
 
   FunctionTester ft(asm_tester.GenerateCode(), kNumParams);
   Handle<Object> result = ft.Call(isolate->factory()->undefined_value(),
@@ -1807,7 +1894,7 @@ class AppendJSArrayCodeStubAssembler : public CodeStubAssembler {
     Return(length);
 
     BIND(&bailout);
-    Return(SmiTag(IntPtrAdd(arg_index, IntPtrConstant(2))));
+    Return(SmiTag(IntPtrAdd(arg_index.value(), IntPtrConstant(2))));
 
     FunctionTester ft(csa_tester->GenerateCode(), kNumParams);
 
@@ -1980,74 +2067,6 @@ TEST(AllocateAndSetJSPromise) {
   CHECK_EQ(v8::Promise::kRejected, js_promise->status());
   CHECK_EQ(Smi::FromInt(1), js_promise->result());
   CHECK(!js_promise->has_handler());
-}
-
-TEST(AllocatePromiseReactionJobInfo) {
-  Isolate* isolate(CcTest::InitIsolateOnce());
-
-  const int kNumParams = 1;
-  CodeAssemblerTester asm_tester(isolate, kNumParams);
-  CodeStubAssembler m(asm_tester.state());
-  PromiseBuiltinsAssembler p(asm_tester.state());
-
-  Node* const context = m.Parameter(kNumParams + 2);
-  Node* const tasks =
-      m.AllocateFixedArray(PACKED_ELEMENTS, m.IntPtrConstant(1));
-  m.StoreFixedArrayElement(tasks, 0, m.UndefinedConstant());
-  Node* const deferred_promise =
-      m.AllocateFixedArray(PACKED_ELEMENTS, m.IntPtrConstant(1));
-  m.StoreFixedArrayElement(deferred_promise, 0, m.UndefinedConstant());
-  Node* const info = m.AllocatePromiseReactionJobInfo(
-      m.SmiConstant(1), tasks, deferred_promise, m.UndefinedConstant(),
-      m.UndefinedConstant(), context);
-  m.Return(info);
-
-  FunctionTester ft(asm_tester.GenerateCode(), kNumParams);
-  Handle<Object> result =
-      ft.Call(isolate->factory()->undefined_value()).ToHandleChecked();
-  CHECK(result->IsPromiseReactionJobInfo());
-  Handle<PromiseReactionJobInfo> promise_info =
-      Handle<PromiseReactionJobInfo>::cast(result);
-  CHECK_EQ(Smi::FromInt(1), promise_info->value());
-  CHECK(promise_info->tasks()->IsFixedArray());
-  CHECK(promise_info->deferred_promise()->IsFixedArray());
-  CHECK(promise_info->deferred_on_resolve()->IsUndefined(isolate));
-  CHECK(promise_info->deferred_on_reject()->IsUndefined(isolate));
-  CHECK(promise_info->context()->IsContext());
-}
-
-TEST(AllocatePromiseResolveThenableJobInfo) {
-  Isolate* isolate(CcTest::InitIsolateOnce());
-
-  const int kNumParams = 1;
-  CodeAssemblerTester asm_tester(isolate, kNumParams);
-  PromiseBuiltinsAssembler p(asm_tester.state());
-
-  Node* const context = p.Parameter(kNumParams + 2);
-  Node* const native_context = p.LoadNativeContext(context);
-  Node* const thenable = p.AllocateAndInitJSPromise(context);
-  Node* const then =
-      p.GetProperty(context, thenable, isolate->factory()->then_string());
-  Node* resolve = nullptr;
-  Node* reject = nullptr;
-  std::tie(resolve, reject) = p.CreatePromiseResolvingFunctions(
-      thenable, p.FalseConstant(), native_context);
-
-  Node* const info = p.AllocatePromiseResolveThenableJobInfo(
-      thenable, then, resolve, reject, context);
-  p.Return(info);
-
-  FunctionTester ft(asm_tester.GenerateCode(), kNumParams);
-  Handle<Object> result =
-      ft.Call(isolate->factory()->undefined_value()).ToHandleChecked();
-  CHECK(result->IsPromiseResolveThenableJobInfo());
-  Handle<PromiseResolveThenableJobInfo> promise_info =
-      Handle<PromiseResolveThenableJobInfo>::cast(result);
-  CHECK(promise_info->thenable()->IsJSPromise());
-  CHECK(promise_info->then()->IsJSFunction());
-  CHECK(promise_info->resolve()->IsJSFunction());
-  CHECK(promise_info->reject()->IsJSFunction());
-  CHECK(promise_info->context()->IsContext());
 }
 
 TEST(IsSymbol) {
@@ -2239,8 +2258,9 @@ TEST(AllocateFunctionWithMapAndContext) {
       m.AllocateAndInitJSPromise(context, m.UndefinedConstant());
   Node* promise_context = m.CreatePromiseResolvingFunctionsContext(
       promise, m.BooleanConstant(false), native_context);
-  Node* resolve_info =
-      m.LoadContextElement(native_context, Context::PROMISE_RESOLVE_SHARED_FUN);
+  Node* resolve_info = m.LoadContextElement(
+      native_context,
+      Context::PROMISE_CAPABILITY_DEFAULT_RESOLVE_SHARED_FUN_INDEX);
   Node* const map = m.LoadContextElement(
       native_context, Context::STRICT_FUNCTION_WITHOUT_PROTOTYPE_MAP_INDEX);
   Node* const resolve =
@@ -2256,8 +2276,10 @@ TEST(AllocateFunctionWithMapAndContext) {
   CHECK_EQ(isolate->heap()->empty_fixed_array(), fun->elements());
   CHECK_EQ(isolate->heap()->undefined_cell(), fun->feedback_vector_cell());
   CHECK(!fun->has_prototype_slot());
-  CHECK_EQ(*isolate->promise_resolve_shared_fun(), fun->shared());
-  CHECK_EQ(isolate->promise_resolve_shared_fun()->code(), fun->code());
+  CHECK_EQ(*isolate->promise_capability_default_resolve_shared_fun(),
+           fun->shared());
+  CHECK_EQ(isolate->promise_capability_default_resolve_shared_fun()->code(),
+           fun->code());
 }
 
 TEST(CreatePromiseGetCapabilitiesExecutorContext) {
@@ -2270,7 +2292,7 @@ TEST(CreatePromiseGetCapabilitiesExecutorContext) {
   Node* const context = m.Parameter(kNumParams + 2);
   Node* const native_context = m.LoadNativeContext(context);
 
-  Node* const map = m.LoadRoot(Heap::kTuple3MapRootIndex);
+  Node* const map = m.LoadRoot(Heap::kPromiseCapabilityMapRootIndex);
   Node* const capability = m.AllocateStruct(map);
   m.StoreObjectFieldNoWriteBarrier(
       capability, PromiseCapability::kPromiseOffset, m.UndefinedConstant());
@@ -2309,8 +2331,10 @@ TEST(NewPromiseCapability) {
     Node* const promise_constructor =
         m.LoadContextElement(native_context, Context::PROMISE_FUNCTION_INDEX);
 
+    Node* const debug_event = m.TrueConstant();
     Node* const capability =
-        m.NewPromiseCapability(context, promise_constructor);
+        m.CallBuiltin(Builtins::kNewPromiseCapability, context,
+                      promise_constructor, debug_event);
     m.Return(capability);
 
     FunctionTester ft(asm_tester.GenerateCode(), kNumParams);
@@ -2324,10 +2348,10 @@ TEST(NewPromiseCapability) {
     CHECK(result->promise()->IsJSPromise());
     CHECK(result->resolve()->IsJSFunction());
     CHECK(result->reject()->IsJSFunction());
-    CHECK_EQ(isolate->native_context()->promise_resolve_shared_fun(),
-             JSFunction::cast(result->resolve())->shared());
-    CHECK_EQ(isolate->native_context()->promise_reject_shared_fun(),
+    CHECK_EQ(*isolate->promise_capability_default_reject_shared_fun(),
              JSFunction::cast(result->reject())->shared());
+    CHECK_EQ(*isolate->promise_capability_default_resolve_shared_fun(),
+             JSFunction::cast(result->resolve())->shared());
 
     Handle<JSFunction> callbacks[] = {
         handle(JSFunction::cast(result->resolve())),
@@ -2353,7 +2377,9 @@ TEST(NewPromiseCapability) {
     Node* const context = m.Parameter(kNumParams + 2);
 
     Node* const constructor = m.Parameter(1);
-    Node* const capability = m.NewPromiseCapability(context, constructor);
+    Node* const debug_event = m.TrueConstant();
+    Node* const capability = m.CallBuiltin(Builtins::kNewPromiseCapability,
+                                           context, constructor, debug_event);
     m.Return(capability);
 
     FunctionTester ft(asm_tester.GenerateCode(), kNumParams);
@@ -2663,7 +2689,7 @@ TEST(GotoIfNotWhiteSpaceOrLineTerminator) {
   }
 }
 
-TEST(BranchIfNumericRelationalComparison) {
+TEST(BranchIfNumberRelationalComparison) {
   Isolate* isolate(CcTest::InitIsolateOnce());
   Factory* f = isolate->factory();
   const int kNumParams = 2;
@@ -2671,9 +2697,9 @@ TEST(BranchIfNumericRelationalComparison) {
   {
     CodeStubAssembler m(asm_tester.state());
     Label return_true(&m), return_false(&m);
-    m.BranchIfNumericRelationalComparison(Operation::kGreaterThanOrEqual,
-                                          m.Parameter(0), m.Parameter(1),
-                                          &return_true, &return_false);
+    m.BranchIfNumberRelationalComparison(Operation::kGreaterThanOrEqual,
+                                         m.Parameter(0), m.Parameter(1),
+                                         &return_true, &return_false);
     m.BIND(&return_true);
     m.Return(m.BooleanConstant(true));
     m.BIND(&return_false);

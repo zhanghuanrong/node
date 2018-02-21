@@ -43,7 +43,7 @@ TEST(WasmRelocationX64ContextReference) {
       isolate->factory()->NewCode(desc, Code::STUB, Handle<Code>());
   USE(code);
 
-  CSignature0<int64_t> csig;
+  CSignatureOf<int64_t> csig;
   CodeRunner<int64_t> runnable(isolate, code, &csig);
   int64_t ret_value = runnable.Call();
   CHECK_EQ(ret_value, imm);
@@ -64,8 +64,7 @@ TEST(WasmRelocationX64ContextReference) {
     CodeSpaceMemoryModificationScope modification_scope(isolate->heap());
     DCHECK(RelocInfo::IsWasmContextReference(it.rinfo()->rmode()));
     it.rinfo()->set_wasm_context_reference(
-        isolate, it.rinfo()->wasm_context_reference() + offset,
-        SKIP_ICACHE_FLUSH);
+        it.rinfo()->wasm_context_reference() + offset, SKIP_ICACHE_FLUSH);
   }
 
   // Check if immediate is updated correctly

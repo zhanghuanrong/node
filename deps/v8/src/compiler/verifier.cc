@@ -51,7 +51,7 @@ class Verifier::Visitor {
       std::ostringstream str;
       str << "TypeError: node #" << node->id() << ":" << *node->op()
           << " should never have a type";
-      FATAL(str.str().c_str());
+      FATAL("%s", str.str().c_str());
     }
   }
   void CheckTypeIs(Node* node, Type* type) {
@@ -62,7 +62,7 @@ class Verifier::Visitor {
       NodeProperties::GetType(node)->PrintTo(str);
       str << " is not ";
       type->PrintTo(str);
-      FATAL(str.str().c_str());
+      FATAL("%s", str.str().c_str());
     }
   }
   void CheckTypeMaybe(Node* node, Type* type) {
@@ -73,7 +73,7 @@ class Verifier::Visitor {
       NodeProperties::GetType(node)->PrintTo(str);
       str << " must intersect ";
       type->PrintTo(str);
-      FATAL(str.str().c_str());
+      FATAL("%s", str.str().c_str());
     }
   }
   void CheckValueInputIs(Node* node, int i, Type* type) {
@@ -86,7 +86,7 @@ class Verifier::Visitor {
       NodeProperties::GetType(input)->PrintTo(str);
       str << " is not ";
       type->PrintTo(str);
-      FATAL(str.str().c_str());
+      FATAL("%s", str.str().c_str());
     }
   }
   void CheckOutput(Node* node, Node* use, int count, const char* kind) {
@@ -95,7 +95,7 @@ class Verifier::Visitor {
       str << "GraphError: node #" << node->id() << ":" << *node->op()
           << " does not produce " << kind << " output used by node #"
           << use->id() << ":" << *use->op();
-      FATAL(str.str().c_str());
+      FATAL("%s", str.str().c_str());
     }
   }
 };
@@ -191,20 +191,18 @@ void Verifier::Visitor::Check(Node* node, const AllNodes& all) {
         }
       }
       if (discovered_if_success && !discovered_if_exception) {
-        V8_Fatal(__FILE__, __LINE__,
-                 "#%d:%s should be followed by IfSuccess/IfException, but is "
-                 "only followed by single #%d:%s",
-                 node->id(), node->op()->mnemonic(),
-                 discovered_if_success->id(),
-                 discovered_if_success->op()->mnemonic());
+        FATAL(
+            "#%d:%s should be followed by IfSuccess/IfException, but is "
+            "only followed by single #%d:%s",
+            node->id(), node->op()->mnemonic(), discovered_if_success->id(),
+            discovered_if_success->op()->mnemonic());
       }
       if (discovered_if_exception && !discovered_if_success) {
-        V8_Fatal(__FILE__, __LINE__,
-                 "#%d:%s should be followed by IfSuccess/IfException, but is "
-                 "only followed by single #%d:%s",
-                 node->id(), node->op()->mnemonic(),
-                 discovered_if_exception->id(),
-                 discovered_if_exception->op()->mnemonic());
+        FATAL(
+            "#%d:%s should be followed by IfSuccess/IfException, but is "
+            "only followed by single #%d:%s",
+            node->id(), node->op()->mnemonic(), discovered_if_exception->id(),
+            discovered_if_exception->op()->mnemonic());
       }
       if (discovered_if_success || discovered_if_exception) {
         CHECK_EQ(2, total_number_of_control_uses);
@@ -236,10 +234,19 @@ void Verifier::Visitor::Check(Node* node, const AllNodes& all) {
       // Dead is never connected to the graph.
       UNREACHABLE();
     case IrOpcode::kDeadValue:
+      CheckValueInputIs(node, 0, Type::None());
       CheckTypeIs(node, Type::None());
       break;
     case IrOpcode::kUnreachable:
-      CheckNotTyped(node);
+      CheckTypeIs(node, Type::None());
+      for (Edge edge : node->use_edges()) {
+        Node* use = edge.from();
+        if (NodeProperties::IsValueEdge(edge) && all.IsLive(use)) {
+          // {Unreachable} nodes can only be used by {DeadValue}, because they
+          // don't actually produce a value.
+          CHECK_EQ(IrOpcode::kDeadValue, use->opcode());
+        }
+      }
       break;
     case IrOpcode::kBranch: {
       // Branch uses are IfTrue and IfFalse.
@@ -259,12 +266,13 @@ void Verifier::Visitor::Check(Node* node, const AllNodes& all) {
       break;
     }
     case IrOpcode::kIfTrue:
-    case IrOpcode::kIfFalse:
-      CHECK_EQ(IrOpcode::kBranch,
-               NodeProperties::GetControlInput(node, 0)->opcode());
+    case IrOpcode::kIfFalse: {
+      Node* control = NodeProperties::GetControlInput(node, 0);
+      CHECK_EQ(IrOpcode::kBranch, control->opcode());
       // Type is empty.
       CheckNotTyped(node);
       break;
+    }
     case IrOpcode::kIfSuccess: {
       // IfSuccess and IfException continuation only on throwing nodes.
       Node* input = NodeProperties::GetControlInput(node, 0);
@@ -302,8 +310,8 @@ void Verifier::Visitor::Check(Node* node, const AllNodes& all) {
             break;
           }
           default: {
-            V8_Fatal(__FILE__, __LINE__, "Switch #%d illegally used by #%d:%s",
-                     node->id(), use->id(), use->op()->mnemonic());
+            FATAL("Switch #%d illegally used by #%d:%s", node->id(), use->id(),
+                  use->op()->mnemonic());
             break;
           }
         }
@@ -563,6 +571,7 @@ void Verifier::Visitor::Check(Node* node, const AllNodes& all) {
     }
     case IrOpcode::kObjectId:
       CheckTypeIs(node, Type::Object());
+      break;
     case IrOpcode::kStateValues:
     case IrOpcode::kTypedStateValues:
     case IrOpcode::kArgumentsElementsState:
@@ -672,6 +681,10 @@ void Verifier::Visitor::Check(Node* node, const AllNodes& all) {
       // Type is OtherObject.
       CheckTypeIs(node, Type::OtherObject());
       break;
+    case IrOpcode::kJSCreatePromise:
+      // Type is OtherObject.
+      CheckTypeIs(node, Type::OtherObject());
+      break;
     case IrOpcode::kJSCreateLiteralArray:
       // Type is Array.
       CheckTypeIs(node, Type::Array());
@@ -732,10 +745,6 @@ void Verifier::Visitor::Check(Node* node, const AllNodes& all) {
     case IrOpcode::kJSOrdinaryHasInstance:
       // Type is Boolean.
       CheckTypeIs(node, Type::Boolean());
-      break;
-    case IrOpcode::kClassOf:
-      // Type is InternaliedString \/ Null.
-      CheckTypeIs(node, Type::InternalizedStringOrNull());
       break;
     case IrOpcode::kTypeOf:
       // Type is InternalizedString.
@@ -822,7 +831,15 @@ void Verifier::Visitor::Check(Node* node, const AllNodes& all) {
       CheckTypeIs(node, Type::SignedSmall());
       break;
 
+    case IrOpcode::kJSGeneratorRestoreContext:
+      CheckTypeIs(node, Type::Any());
+      break;
+
     case IrOpcode::kJSGeneratorRestoreRegister:
+      CheckTypeIs(node, Type::Any());
+      break;
+
+    case IrOpcode::kJSGeneratorRestoreInputOrDebugPos:
       CheckTypeIs(node, Type::Any());
       break;
 
@@ -830,6 +847,35 @@ void Verifier::Visitor::Check(Node* node, const AllNodes& all) {
     case IrOpcode::kJSDebugger:
       // Type is empty.
       CheckNotTyped(node);
+      break;
+
+    case IrOpcode::kJSFulfillPromise:
+      CheckValueInputIs(node, 0, Type::Any());
+      CheckValueInputIs(node, 1, Type::Any());
+      CheckTypeIs(node, Type::Undefined());
+      break;
+    case IrOpcode::kJSPerformPromiseThen:
+      CheckValueInputIs(node, 0, Type::Any());
+      CheckValueInputIs(node, 1, Type::Any());
+      CheckValueInputIs(node, 2, Type::Any());
+      CheckValueInputIs(node, 3, Type::Any());
+      CheckTypeIs(node, Type::Receiver());
+      break;
+    case IrOpcode::kJSPromiseResolve:
+      CheckValueInputIs(node, 0, Type::Any());
+      CheckValueInputIs(node, 1, Type::Any());
+      CheckTypeIs(node, Type::Receiver());
+      break;
+    case IrOpcode::kJSRejectPromise:
+      CheckValueInputIs(node, 0, Type::Any());
+      CheckValueInputIs(node, 1, Type::Any());
+      CheckValueInputIs(node, 2, Type::Any());
+      CheckTypeIs(node, Type::Undefined());
+      break;
+    case IrOpcode::kJSResolvePromise:
+      CheckValueInputIs(node, 0, Type::Any());
+      CheckValueInputIs(node, 1, Type::Any());
+      CheckTypeIs(node, Type::Undefined());
       break;
 
     case IrOpcode::kComment:
@@ -984,6 +1030,11 @@ void Verifier::Visitor::Check(Node* node, const AllNodes& all) {
       CheckValueInputIs(node, 0, Type::Number());
       CheckTypeIs(node, Type::Signed32());
       break;
+    case IrOpcode::kNumberToString:
+      // Number -> String
+      CheckValueInputIs(node, 0, Type::Number());
+      CheckTypeIs(node, Type::String());
+      break;
     case IrOpcode::kNumberToUint32:
     case IrOpcode::kNumberToUint8Clamped:
       // Number -> Unsigned32
@@ -1041,6 +1092,18 @@ void Verifier::Visitor::Check(Node* node, const AllNodes& all) {
       CheckValueInputIs(node, 1, Type::Unsigned32());
       CheckTypeIs(node, Type::UnsignedSmall());
       break;
+    case IrOpcode::kStringCodePointAt:
+      // (String, Unsigned32) -> UnsignedSmall
+      CheckValueInputIs(node, 0, Type::String());
+      CheckValueInputIs(node, 1, Type::Unsigned32());
+      CheckTypeIs(node, Type::UnsignedSmall());
+      break;
+    case IrOpcode::kSeqStringCodePointAt:
+      // (String, Unsigned32) -> UnsignedSmall
+      CheckValueInputIs(node, 0, Type::String());
+      CheckValueInputIs(node, 1, Type::Unsigned32());
+      CheckTypeIs(node, Type::UnsignedSmall());
+      break;
     case IrOpcode::kStringFromCharCode:
       // Number -> String
       CheckValueInputIs(node, 0, Type::Number());
@@ -1057,6 +1120,10 @@ void Verifier::Visitor::Check(Node* node, const AllNodes& all) {
       CheckValueInputIs(node, 1, Type::String());
       CheckValueInputIs(node, 2, Type::SignedSmall());
       CheckTypeIs(node, Type::SignedSmall());
+      break;
+    case IrOpcode::kStringLength:
+      CheckValueInputIs(node, 0, Type::String());
+      CheckTypeIs(node, TypeCache::Get().kStringLengthType);
       break;
     case IrOpcode::kStringToLowerCaseIntl:
     case IrOpcode::kStringToUpperCaseIntl:
@@ -1094,6 +1161,10 @@ void Verifier::Visitor::Check(Node* node, const AllNodes& all) {
       CheckValueInputIs(node, 0, Type::Any());
       CheckTypeIs(node, Type::Boolean());
       break;
+    case IrOpcode::kNumberIsFloat64Hole:
+      CheckValueInputIs(node, 0, Type::NumberOrHole());
+      CheckTypeIs(node, Type::Boolean());
+      break;
     case IrOpcode::kFindOrderedHashMapEntry:
       CheckValueInputIs(node, 0, Type::Any());
       CheckTypeIs(node, Type::SignedSmall());
@@ -1121,6 +1192,12 @@ void Verifier::Visitor::Check(Node* node, const AllNodes& all) {
       CheckValueInputIs(node, 1, Type::Range(-Code::kMaxArguments,
                                              Code::kMaxArguments, zone));
       CheckTypeIs(node, Type::OtherInternal());
+      break;
+    case IrOpcode::kNewConsString:
+      CheckValueInputIs(node, 0, TypeCache::Get().kStringLengthType);
+      CheckValueInputIs(node, 1, Type::String());
+      CheckValueInputIs(node, 2, Type::String());
+      CheckTypeIs(node, Type::OtherString());
       break;
     case IrOpcode::kAllocate:
       CheckValueInputIs(node, 0, Type::PlainNumber());
@@ -1427,6 +1504,7 @@ void Verifier::Visitor::Check(Node* node, const AllNodes& all) {
     // Machine operators
     // -----------------------
     case IrOpcode::kLoad:
+    case IrOpcode::kPoisonedLoad:
     case IrOpcode::kProtectedLoad:
     case IrOpcode::kProtectedStore:
     case IrOpcode::kStore:
@@ -1586,13 +1664,12 @@ void Verifier::Visitor::Check(Node* node, const AllNodes& all) {
     case IrOpcode::kWord32PairShl:
     case IrOpcode::kWord32PairShr:
     case IrOpcode::kWord32PairSar:
+    case IrOpcode::kSpeculationPoison:
     case IrOpcode::kLoadStackPointer:
     case IrOpcode::kLoadFramePointer:
     case IrOpcode::kLoadParentFramePointer:
     case IrOpcode::kUnalignedLoad:
     case IrOpcode::kUnalignedStore:
-    case IrOpcode::kCheckedLoad:
-    case IrOpcode::kCheckedStore:
     case IrOpcode::kAtomicLoad:
     case IrOpcode::kAtomicStore:
     case IrOpcode::kAtomicExchange:
@@ -1602,6 +1679,12 @@ void Verifier::Visitor::Check(Node* node, const AllNodes& all) {
     case IrOpcode::kAtomicAnd:
     case IrOpcode::kAtomicOr:
     case IrOpcode::kAtomicXor:
+    case IrOpcode::kSpeculationFence:
+    case IrOpcode::kSignExtendWord8ToInt32:
+    case IrOpcode::kSignExtendWord16ToInt32:
+    case IrOpcode::kSignExtendWord8ToInt64:
+    case IrOpcode::kSignExtendWord16ToInt64:
+    case IrOpcode::kSignExtendWord32ToInt64:
 
 #define SIMD_MACHINE_OP_CASE(Name) case IrOpcode::k##Name:
       MACHINE_SIMD_OP_LIST(SIMD_MACHINE_OP_CASE)
@@ -1630,9 +1713,8 @@ void Verifier::Run(Graph* graph, Typing typing, CheckInputs check_inputs,
           other->opcode() == IrOpcode::kProjection &&
           other->InputAt(0) == node &&
           ProjectionIndexOf(other->op()) == ProjectionIndexOf(proj->op())) {
-        V8_Fatal(__FILE__, __LINE__,
-                 "Node #%d:%s has duplicate projections #%d and #%d",
-                 node->id(), node->op()->mnemonic(), proj->id(), other->id());
+        FATAL("Node #%d:%s has duplicate projections #%d and #%d", node->id(),
+              node->op()->mnemonic(), proj->id(), other->id());
       }
     }
   }
@@ -1683,10 +1765,9 @@ static void CheckInputsDominate(Schedule* schedule, BasicBlock* block,
     Node* input = node->InputAt(j);
     if (!HasDominatingDef(schedule, node->InputAt(j), block, use_block,
                           use_pos)) {
-      V8_Fatal(__FILE__, __LINE__,
-               "Node #%d:%s in B%d is not dominated by input@%d #%d:%s",
-               node->id(), node->op()->mnemonic(), block->rpo_number(), j,
-               input->id(), input->op()->mnemonic());
+      FATAL("Node #%d:%s in B%d is not dominated by input@%d #%d:%s",
+            node->id(), node->op()->mnemonic(), block->rpo_number(), j,
+            input->id(), input->op()->mnemonic());
     }
   }
   // Ensure that nodes are dominated by their control inputs;
@@ -1696,10 +1777,9 @@ static void CheckInputsDominate(Schedule* schedule, BasicBlock* block,
       node->opcode() != IrOpcode::kEnd) {
     Node* ctl = NodeProperties::GetControlInput(node);
     if (!Dominates(schedule, ctl, node)) {
-      V8_Fatal(__FILE__, __LINE__,
-               "Node #%d:%s in B%d is not dominated by control input #%d:%s",
-               node->id(), node->op()->mnemonic(), block->rpo_number(),
-               ctl->id(), ctl->op()->mnemonic());
+      FATAL("Node #%d:%s in B%d is not dominated by control input #%d:%s",
+            node->id(), node->op()->mnemonic(), block->rpo_number(), ctl->id(),
+            ctl->op()->mnemonic());
     }
   }
 }
@@ -1792,8 +1872,8 @@ void ScheduleVerifier::Run(Schedule* schedule) {
       BitVector* block_doms = dominators[block->id().ToSize()];
       BasicBlock* idom = block->dominator();
       if (idom != nullptr && !block_doms->Contains(idom->id().ToInt())) {
-        V8_Fatal(__FILE__, __LINE__, "Block B%d is not dominated by B%d",
-                 block->rpo_number(), idom->rpo_number());
+        FATAL("Block B%d is not dominated by B%d", block->rpo_number(),
+              idom->rpo_number());
       }
       for (size_t s = 0; s < block->SuccessorCount(); s++) {
         BasicBlock* succ = block->SuccessorAt(s);
@@ -1829,9 +1909,8 @@ void ScheduleVerifier::Run(Schedule* schedule) {
             schedule->GetBlockById(BasicBlock::Id::FromInt(it.Current()));
         if (dom != idom &&
             !dominators[idom->id().ToSize()]->Contains(dom->id().ToInt())) {
-          V8_Fatal(__FILE__, __LINE__,
-                   "Block B%d is not immediately dominated by B%d",
-                   block->rpo_number(), idom->rpo_number());
+          FATAL("Block B%d is not immediately dominated by B%d",
+                block->rpo_number(), idom->rpo_number());
         }
       }
     }

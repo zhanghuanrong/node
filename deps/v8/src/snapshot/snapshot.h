@@ -31,7 +31,7 @@ class SnapshotData : public SerializedData {
       : SerializedData(const_cast<byte*>(snapshot.begin()), snapshot.length()) {
   }
 
-  Vector<const Reservation> Reservations() const;
+  std::vector<Reservation> Reservations() const;
   virtual Vector<const byte> Payload() const;
 
   Vector<const byte> RawData() const {
@@ -97,6 +97,7 @@ class Snapshot : public AllStatic {
   // runtime after the isolate (and the builtins table) has been fully
   // initialized.
   static Code* DeserializeBuiltin(Isolate* isolate, int builtin_id);
+  static void EnsureAllBuiltinsAreDeserialized(Isolate* isolate);
 
   // Deserializes a single given handler code object. Intended to be called at
   // runtime after the isolate has been fully initialized.

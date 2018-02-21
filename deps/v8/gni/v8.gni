@@ -45,6 +45,9 @@ declare_args() {
 
   # Use static libraries instead of source_sets.
   v8_static_library = false
+
+  # Enable monolithic static library for embedders.
+  v8_monolithic = false
 }
 
 if (v8_use_external_startup_data == "") {
@@ -97,9 +100,15 @@ if (v8_code_coverage && !is_clang) {
   ]
 }
 
-if (is_posix && v8_enable_backtrace) {
+if (is_posix && (v8_enable_backtrace || v8_monolithic)) {
   v8_remove_configs += [ "//build/config/gcc:symbol_visibility_hidden" ]
   v8_add_configs += [ "//build/config/gcc:symbol_visibility_default" ]
+}
+
+# On MIPS gcc_target_rpath and ldso_path might be needed for all builds.
+if (target_cpu == "mipsel" || target_cpu == "mips64el" ||
+    target_cpu == "mips" || target_cpu == "mips64") {
+  v8_add_configs += [ "//build/config/gcc:rpath_for_built_shared_libraries" ]
 }
 
 # All templates should be kept in sync.

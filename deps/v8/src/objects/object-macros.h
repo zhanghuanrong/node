@@ -7,6 +7,8 @@
 
 // Note 2: This file is deliberately missing the include guards (the undeffing
 // approach wouldn't work otherwise).
+//
+// PRESUBMIT_INTENTIONALLY_MISSING_INCLUDE_GUARD
 
 // The accessors with RELAXED_, ACQUIRE_, and RELEASE_ prefixes should be used
 // for fields that can be written to and read from multiple threads at the same
@@ -54,8 +56,9 @@
 #define ACCESSORS_CHECKED2(holder, name, type, offset, get_condition, \
                            set_condition)                             \
   type* holder::name() const {                                        \
+    type* value = type::cast(READ_FIELD(this, offset));               \
     DCHECK(get_condition);                                            \
-    return type::cast(READ_FIELD(this, offset));                      \
+    return value;                                                     \
   }                                                                   \
   void holder::set_##name(type* value, WriteBarrierMode mode) {       \
     DCHECK(set_condition);                                            \

@@ -20,7 +20,6 @@ ParseInfo::ParseInfo(AccountingAllocator* zone_allocator)
     : zone_(std::make_shared<Zone>(zone_allocator, ZONE_NAME)),
       flags_(0),
       extension_(nullptr),
-      compile_options_(ScriptCompiler::kNoCompileOptions),
       script_scope_(nullptr),
       unicode_cache_(nullptr),
       stack_limit_(0),
@@ -32,7 +31,6 @@ ParseInfo::ParseInfo(AccountingAllocator* zone_allocator)
       function_literal_id_(FunctionLiteral::kIdTypeInvalid),
       max_function_literal_id_(FunctionLiteral::kIdTypeInvalid),
       character_stream_(nullptr),
-      cached_data_(nullptr),
       ast_value_factory_(nullptr),
       ast_string_constants_(nullptr),
       function_name_(nullptr),
@@ -45,7 +43,13 @@ ParseInfo::ParseInfo(Handle<SharedFunctionInfo> shared)
   Isolate* isolate = shared->GetIsolate();
   InitFromIsolate(isolate);
 
+  // Do not support re-parsing top-level function of a wrapped script.
+  // TODO(yangguo): consider whether we need a top-level function in a
+  //                wrapped script at all.
+  DCHECK_IMPLIES(is_toplevel(), !Script::cast(shared->script())->is_wrapped());
+
   set_toplevel(shared->is_toplevel());
+  set_wrapped_as_function(shared->is_wrapped());
   set_allow_lazy_parsing(FLAG_lazy_inner_functions);
   set_is_named_expression(shared->is_named_expression());
   set_compiler_hints(shared->compiler_hints());
@@ -54,8 +58,6 @@ ParseInfo::ParseInfo(Handle<SharedFunctionInfo> shared)
   function_literal_id_ = shared->function_literal_id();
   set_language_mode(shared->language_mode());
   set_asm_wasm_broken(shared->is_asm_wasm_broken());
-  set_requires_instance_fields_initializer(
-      shared->requires_instance_fields_initializer());
 
   Handle<Script> script(Script::cast(shared->script()));
   set_script(script);
@@ -90,6 +92,7 @@ ParseInfo::ParseInfo(Handle<Script> script)
   set_allow_lazy_parsing();
   set_toplevel();
   set_script(script);
+  set_wrapped_as_function(script->is_wrapped());
 
   set_native(script->type() == Script::TYPE_NATIVE);
   set_eval(script->compilation_type() == Script::COMPILATION_TYPE_EVAL);
@@ -149,6 +152,11 @@ bool ParseInfo::is_declaration() const {
 
 FunctionKind ParseInfo::function_kind() const {
   return SharedFunctionInfo::FunctionKindBits::decode(compiler_hints_);
+}
+
+bool ParseInfo::requires_instance_fields_initializer() const {
+  return SharedFunctionInfo::RequiresInstanceFieldsInitializer::decode(
+      compiler_hints_);
 }
 
 void ParseInfo::InitFromIsolate(Isolate* isolate) {

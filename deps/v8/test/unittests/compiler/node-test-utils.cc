@@ -2025,6 +2025,9 @@ Matcher<Node*> IsParameter(const Matcher<int> index_matcher) {
   return MakeMatcher(new IsParameterMatcher(index_matcher));
 }
 
+Matcher<Node*> IsSpeculationPoison() {
+  return MakeMatcher(new TestNodeMatcher(IrOpcode::kSpeculationPoison));
+}
 
 Matcher<Node*> IsLoadFramePointer() {
   return MakeMatcher(new TestNodeMatcher(IrOpcode::kLoadFramePointer));
@@ -2123,9 +2126,7 @@ IS_BINOP_MATCHER(Float64InsertHighWord32)
     return MakeMatcher(new IsUnopMatcher(IrOpcode::k##Name, input_matcher)); \
   }
 IS_UNOP_MATCHER(BooleanNot)
-IS_UNOP_MATCHER(BitcastTaggedToWord)
 IS_UNOP_MATCHER(BitcastWordToTagged)
-IS_UNOP_MATCHER(BitcastWordToTaggedSigned)
 IS_UNOP_MATCHER(TruncateFloat64ToWord32)
 IS_UNOP_MATCHER(ChangeFloat64ToInt32)
 IS_UNOP_MATCHER(ChangeFloat64ToUint32)
@@ -2182,11 +2183,33 @@ IS_UNOP_MATCHER(ObjectIsReceiver)
 IS_UNOP_MATCHER(ObjectIsSmi)
 IS_UNOP_MATCHER(ObjectIsUndetectable)
 IS_UNOP_MATCHER(StringFromCharCode)
+IS_UNOP_MATCHER(StringLength)
 IS_UNOP_MATCHER(Word32Clz)
 IS_UNOP_MATCHER(Word32Ctz)
 IS_UNOP_MATCHER(Word32Popcnt)
 IS_UNOP_MATCHER(Word32ReverseBytes)
 #undef IS_UNOP_MATCHER
+
+// Special-case Bitcast operators which are disabled when ENABLE_VERIFY_CSA is
+// not enabled.
+Matcher<Node*> IsBitcastTaggedToWord(const Matcher<Node*>& input_matcher) {
+#ifdef ENABLE_VERIFY_CSA
+  return MakeMatcher(
+      new IsUnopMatcher(IrOpcode::kBitcastTaggedToWord, input_matcher));
+#else
+  return input_matcher;
+#endif
+}
+
+Matcher<Node*> IsBitcastWordToTaggedSigned(
+    const Matcher<Node*>& input_matcher) {
+#ifdef ENABLE_VERIFY_CSA
+  return MakeMatcher(
+      new IsUnopMatcher(IrOpcode::kBitcastWordToTaggedSigned, input_matcher));
+#else
+  return input_matcher;
+#endif
+}
 
 }  // namespace compiler
 }  // namespace internal

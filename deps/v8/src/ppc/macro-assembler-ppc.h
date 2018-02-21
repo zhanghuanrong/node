@@ -15,20 +15,23 @@ namespace v8 {
 namespace internal {
 
 // Give alias names to registers for calling conventions.
-const Register kReturnRegister0 = r3;
-const Register kReturnRegister1 = r4;
-const Register kReturnRegister2 = r5;
-const Register kJSFunctionRegister = r4;
-const Register kContextRegister = r30;
-const Register kAllocateSizeRegister = r4;
-const Register kInterpreterAccumulatorRegister = r3;
-const Register kInterpreterBytecodeOffsetRegister = r15;
-const Register kInterpreterBytecodeArrayRegister = r16;
-const Register kInterpreterDispatchTableRegister = r17;
-const Register kJavaScriptCallArgCountRegister = r3;
-const Register kJavaScriptCallNewTargetRegister = r6;
-const Register kRuntimeCallFunctionRegister = r4;
-const Register kRuntimeCallArgCountRegister = r3;
+constexpr Register kReturnRegister0 = r3;
+constexpr Register kReturnRegister1 = r4;
+constexpr Register kReturnRegister2 = r5;
+constexpr Register kJSFunctionRegister = r4;
+constexpr Register kContextRegister = r30;
+constexpr Register kAllocateSizeRegister = r4;
+constexpr Register kSpeculationPoisonRegister = r14;
+constexpr Register kInterpreterAccumulatorRegister = r3;
+constexpr Register kInterpreterBytecodeOffsetRegister = r15;
+constexpr Register kInterpreterBytecodeArrayRegister = r16;
+constexpr Register kInterpreterDispatchTableRegister = r17;
+constexpr Register kJavaScriptCallArgCountRegister = r3;
+constexpr Register kJavaScriptCallNewTargetRegister = r6;
+constexpr Register kJavaScriptCallCodeStartRegister = r5;
+constexpr Register kOffHeapTrampolineRegister = ip;
+constexpr Register kRuntimeCallFunctionRegister = r4;
+constexpr Register kRuntimeCallArgCountRegister = r3;
 
 // ----------------------------------------------------------------------------
 // Static helper functions
@@ -404,13 +407,13 @@ class TurboAssembler : public Assembler {
 
   // Calls Abort(msg) if the condition cond is not satisfied.
   // Use --debug_code to enable.
-  void Assert(Condition cond, BailoutReason reason, CRegister cr = cr7);
+  void Assert(Condition cond, AbortReason reason, CRegister cr = cr7);
 
   // Like Assert(), but always enabled.
-  void Check(Condition cond, BailoutReason reason, CRegister cr = cr7);
+  void Check(Condition cond, AbortReason reason, CRegister cr = cr7);
 
   // Print a message to stdout and abort execution.
-  void Abort(BailoutReason reason);
+  void Abort(AbortReason reason);
 
   inline bool AllowThisStubCall(CodeStub* stub);
 #if !V8_TARGET_ARCH_PPC64
@@ -647,6 +650,8 @@ class TurboAssembler : public Assembler {
 #endif
   }
 
+  void ResetSpeculationPoisonRegister();
+
  private:
   static const int kSmiShift = kSmiTagSize + kSmiShiftSize;
 
@@ -829,10 +834,6 @@ class MacroAssembler : public TurboAssembler {
   void InvokeFunction(Register function, const ParameterCount& expected,
                       const ParameterCount& actual, InvokeFlag flag);
 
-  void InvokeFunction(Handle<JSFunction> function,
-                      const ParameterCount& expected,
-                      const ParameterCount& actual, InvokeFlag flag);
-
   void DebugBreak();
   // Frame restart support
   void MaybeDropFrames();
@@ -932,6 +933,9 @@ class MacroAssembler : public TurboAssembler {
   // Jump to a runtime routine.
   void JumpToExternalReference(const ExternalReference& builtin,
                                bool builtin_exit_frame = false);
+
+  // Generates a trampoline to jump to the off-heap instruction stream.
+  void JumpToInstructionStream(const InstructionStream* stream);
 
   // ---------------------------------------------------------------------------
   // StatsCounter support

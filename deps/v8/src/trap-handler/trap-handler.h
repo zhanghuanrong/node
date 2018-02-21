@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#ifndef V8_TRAP_HANDLER_H_
-#define V8_TRAP_HANDLER_H_
+#ifndef V8_TRAP_HANDLER_TRAP_HANDLER_H_
+#define V8_TRAP_HANDLER_TRAP_HANDLER_H_
 
 #include <signal.h>
 #include <stdint.h>
@@ -66,7 +66,7 @@ void ReleaseHandlerData(int index);
 #define THREAD_LOCAL __thread
 #endif
 
-inline bool UseTrapHandler() {
+inline bool IsTrapHandlerEnabled() {
   return FLAG_wasm_trap_handler && V8_TRAP_HANDLER_SUPPORTED;
 }
 
@@ -75,14 +75,14 @@ extern THREAD_LOCAL int g_thread_in_wasm_code;
 inline bool IsThreadInWasm() { return g_thread_in_wasm_code; }
 
 inline void SetThreadInWasm() {
-  if (UseTrapHandler()) {
+  if (IsTrapHandlerEnabled()) {
     DCHECK(!IsThreadInWasm());
     g_thread_in_wasm_code = true;
   }
 }
 
 inline void ClearThreadInWasm() {
-  if (UseTrapHandler()) {
+  if (IsTrapHandlerEnabled()) {
     DCHECK(IsThreadInWasm());
     g_thread_in_wasm_code = false;
   }
@@ -101,4 +101,4 @@ size_t GetRecoveredTrapCount();
 }  // namespace internal
 }  // namespace v8
 
-#endif  // V8_TRAP_HANDLER_H_
+#endif  // V8_TRAP_HANDLER_TRAP_HANDLER_H_

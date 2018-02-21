@@ -92,7 +92,7 @@ MemoryPressureTask::MemoryPressureTask(Isolate* isolate,
 MemoryPressureTask::~MemoryPressureTask() {}
 
 void MemoryPressureTask::RunInternal() {
-  dispatcher_->AbortAll(CompilerDispatcher::BlockingBehavior::kDontBlock);
+  dispatcher_->AbortAll(BlockingBehavior::kDontBlock);
 }
 
 }  // namespace
@@ -305,7 +305,7 @@ void CompilerDispatcher::WaitForJobIfRunningOnBackground(
   TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
                "V8.CompilerDispatcherWaitForBackgroundJob");
   RuntimeCallTimerScope runtimeTimer(
-      isolate_, &RuntimeCallStats::CompileWaitForDispatcher);
+      isolate_, RuntimeCallCounterId::kCompileWaitForDispatcher);
 
   base::LockGuard<base::Mutex> lock(&mutex_);
   if (running_background_jobs_.find(job) == running_background_jobs_.end()) {

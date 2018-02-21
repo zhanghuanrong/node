@@ -9,9 +9,9 @@
 #include "src/base/lazy-instance.h"
 #include "src/compiler/opcodes.h"
 #include "src/compiler/operator.h"
-#include "src/feedback-vector.h"
 #include "src/handles-inl.h"
 #include "src/objects-inl.h"
+#include "src/vector-slot-pair.h"
 
 namespace v8 {
 namespace internal {
@@ -26,29 +26,6 @@ CallFrequency CallFrequencyOf(Operator const* op) {
   DCHECK(op->opcode() == IrOpcode::kJSCallWithArrayLike ||
          op->opcode() == IrOpcode::kJSConstructWithArrayLike);
   return OpParameter<CallFrequency>(op);
-}
-
-VectorSlotPair::VectorSlotPair() {}
-
-
-int VectorSlotPair::index() const {
-  return vector_.is_null() ? -1 : FeedbackVector::GetIndex(slot_);
-}
-
-
-bool operator==(VectorSlotPair const& lhs, VectorSlotPair const& rhs) {
-  return lhs.slot() == rhs.slot() &&
-         lhs.vector().location() == rhs.vector().location();
-}
-
-
-bool operator!=(VectorSlotPair const& lhs, VectorSlotPair const& rhs) {
-  return !(lhs == rhs);
-}
-
-
-size_t hash_value(VectorSlotPair const& p) {
-  return base::hash_combine(p.slot(), p.vector().location());
 }
 
 
@@ -566,41 +543,49 @@ CompareOperationHint CompareOperationHintOf(const Operator* op) {
   return OpParameter<CompareOperationHint>(op);
 }
 
-#define CACHED_OP_LIST(V)                                       \
-  V(BitwiseOr, Operator::kNoProperties, 2, 1)                   \
-  V(BitwiseXor, Operator::kNoProperties, 2, 1)                  \
-  V(BitwiseAnd, Operator::kNoProperties, 2, 1)                  \
-  V(ShiftLeft, Operator::kNoProperties, 2, 1)                   \
-  V(ShiftRight, Operator::kNoProperties, 2, 1)                  \
-  V(ShiftRightLogical, Operator::kNoProperties, 2, 1)           \
-  V(Subtract, Operator::kNoProperties, 2, 1)                    \
-  V(Multiply, Operator::kNoProperties, 2, 1)                    \
-  V(Divide, Operator::kNoProperties, 2, 1)                      \
-  V(Modulus, Operator::kNoProperties, 2, 1)                     \
-  V(Exponentiate, Operator::kNoProperties, 2, 1)                \
-  V(BitwiseNot, Operator::kNoProperties, 1, 1)                  \
-  V(Decrement, Operator::kNoProperties, 1, 1)                   \
-  V(Increment, Operator::kNoProperties, 1, 1)                   \
-  V(Negate, Operator::kNoProperties, 1, 1)                      \
-  V(ToInteger, Operator::kNoProperties, 1, 1)                   \
-  V(ToLength, Operator::kNoProperties, 1, 1)                    \
-  V(ToName, Operator::kNoProperties, 1, 1)                      \
-  V(ToNumber, Operator::kNoProperties, 1, 1)                    \
-  V(ToNumeric, Operator::kNoProperties, 1, 1)                   \
-  V(ToObject, Operator::kFoldable, 1, 1)                        \
-  V(ToString, Operator::kNoProperties, 1, 1)                    \
-  V(Create, Operator::kNoProperties, 2, 1)                      \
-  V(CreateIterResultObject, Operator::kEliminatable, 2, 1)      \
-  V(CreateKeyValueArray, Operator::kEliminatable, 2, 1)         \
-  V(HasProperty, Operator::kNoProperties, 2, 1)                 \
-  V(HasInPrototypeChain, Operator::kNoProperties, 2, 1)         \
-  V(OrdinaryHasInstance, Operator::kNoProperties, 2, 1)         \
-  V(ForInEnumerate, Operator::kNoProperties, 1, 1)              \
-  V(LoadMessage, Operator::kNoThrow | Operator::kNoWrite, 0, 1) \
-  V(StoreMessage, Operator::kNoRead | Operator::kNoThrow, 1, 0) \
-  V(GeneratorRestoreContinuation, Operator::kNoThrow, 1, 1)     \
-  V(StackCheck, Operator::kNoWrite, 0, 0)                       \
-  V(Debugger, Operator::kNoProperties, 0, 0)                    \
+#define CACHED_OP_LIST(V)                                              \
+  V(BitwiseOr, Operator::kNoProperties, 2, 1)                          \
+  V(BitwiseXor, Operator::kNoProperties, 2, 1)                         \
+  V(BitwiseAnd, Operator::kNoProperties, 2, 1)                         \
+  V(ShiftLeft, Operator::kNoProperties, 2, 1)                          \
+  V(ShiftRight, Operator::kNoProperties, 2, 1)                         \
+  V(ShiftRightLogical, Operator::kNoProperties, 2, 1)                  \
+  V(Subtract, Operator::kNoProperties, 2, 1)                           \
+  V(Multiply, Operator::kNoProperties, 2, 1)                           \
+  V(Divide, Operator::kNoProperties, 2, 1)                             \
+  V(Modulus, Operator::kNoProperties, 2, 1)                            \
+  V(Exponentiate, Operator::kNoProperties, 2, 1)                       \
+  V(BitwiseNot, Operator::kNoProperties, 1, 1)                         \
+  V(Decrement, Operator::kNoProperties, 1, 1)                          \
+  V(Increment, Operator::kNoProperties, 1, 1)                          \
+  V(Negate, Operator::kNoProperties, 1, 1)                             \
+  V(ToInteger, Operator::kNoProperties, 1, 1)                          \
+  V(ToLength, Operator::kNoProperties, 1, 1)                           \
+  V(ToName, Operator::kNoProperties, 1, 1)                             \
+  V(ToNumber, Operator::kNoProperties, 1, 1)                           \
+  V(ToNumeric, Operator::kNoProperties, 1, 1)                          \
+  V(ToObject, Operator::kFoldable, 1, 1)                               \
+  V(ToString, Operator::kNoProperties, 1, 1)                           \
+  V(Create, Operator::kNoProperties, 2, 1)                             \
+  V(CreateIterResultObject, Operator::kEliminatable, 2, 1)             \
+  V(CreateKeyValueArray, Operator::kEliminatable, 2, 1)                \
+  V(CreatePromise, Operator::kEliminatable, 0, 1)                      \
+  V(HasProperty, Operator::kNoProperties, 2, 1)                        \
+  V(HasInPrototypeChain, Operator::kNoProperties, 2, 1)                \
+  V(OrdinaryHasInstance, Operator::kNoProperties, 2, 1)                \
+  V(ForInEnumerate, Operator::kNoProperties, 1, 1)                     \
+  V(LoadMessage, Operator::kNoThrow | Operator::kNoWrite, 0, 1)        \
+  V(StoreMessage, Operator::kNoRead | Operator::kNoThrow, 1, 0)        \
+  V(GeneratorRestoreContinuation, Operator::kNoThrow, 1, 1)            \
+  V(GeneratorRestoreContext, Operator::kNoThrow, 1, 1)                 \
+  V(GeneratorRestoreInputOrDebugPos, Operator::kNoThrow, 1, 1)         \
+  V(StackCheck, Operator::kNoWrite, 0, 0)                              \
+  V(Debugger, Operator::kNoProperties, 0, 0)                           \
+  V(FulfillPromise, Operator::kNoDeopt | Operator::kNoThrow, 2, 1)     \
+  V(PerformPromiseThen, Operator::kNoDeopt | Operator::kNoThrow, 4, 1) \
+  V(PromiseResolve, Operator::kNoProperties, 2, 1)                     \
+  V(RejectPromise, Operator::kNoDeopt | Operator::kNoThrow, 3, 1)      \
+  V(ResolvePromise, Operator::kNoDeopt | Operator::kNoThrow, 2, 1)     \
   V(GetSuperConstructor, Operator::kNoWrite, 1, 1)
 
 #define BINARY_OP_LIST(V) V(Add)
@@ -645,6 +630,7 @@ struct JSOperatorGlobalCache final {
   Name##Operator<BinaryOperationHint::kNumberOrOddball>                       \
       k##Name##NumberOrOddballOperator;                                       \
   Name##Operator<BinaryOperationHint::kString> k##Name##StringOperator;       \
+  Name##Operator<BinaryOperationHint::kBigInt> k##Name##BigIntOperator;       \
   Name##Operator<BinaryOperationHint::kAny> k##Name##AnyOperator;
   BINARY_OP_LIST(BINARY_OP)
 #undef BINARY_OP
@@ -667,6 +653,7 @@ struct JSOperatorGlobalCache final {
       k##Name##InternalizedStringOperator;                                   \
   Name##Operator<CompareOperationHint::kString> k##Name##StringOperator;     \
   Name##Operator<CompareOperationHint::kSymbol> k##Name##SymbolOperator;     \
+  Name##Operator<CompareOperationHint::kBigInt> k##Name##BigIntOperator;     \
   Name##Operator<CompareOperationHint::kReceiver> k##Name##ReceiverOperator; \
   Name##Operator<CompareOperationHint::kAny> k##Name##AnyOperator;
   COMPARE_OP_LIST(COMPARE_OP)
@@ -703,6 +690,8 @@ CACHED_OP_LIST(CACHED_OP)
         return &cache_.k##Name##NumberOrOddballOperator;              \
       case BinaryOperationHint::kString:                              \
         return &cache_.k##Name##StringOperator;                       \
+      case BinaryOperationHint::kBigInt:                              \
+        return &cache_.k##Name##BigIntOperator;                       \
       case BinaryOperationHint::kAny:                                 \
         return &cache_.k##Name##AnyOperator;                          \
     }                                                                 \
@@ -729,6 +718,8 @@ BINARY_OP_LIST(BINARY_OP)
         return &cache_.k##Name##StringOperator;                        \
       case CompareOperationHint::kSymbol:                              \
         return &cache_.k##Name##SymbolOperator;                        \
+      case CompareOperationHint::kBigInt:                              \
+        return &cache_.k##Name##BigIntOperator;                        \
       case CompareOperationHint::kReceiver:                            \
         return &cache_.k##Name##ReceiverOperator;                      \
       case CompareOperationHint::kAny:                                 \
@@ -763,8 +754,10 @@ const Operator* JSOperatorBuilder::CallForwardVarargs(size_t arity,
 
 const Operator* JSOperatorBuilder::Call(size_t arity, CallFrequency frequency,
                                         VectorSlotPair const& feedback,
-                                        ConvertReceiverMode convert_mode) {
-  CallParameters parameters(arity, frequency, feedback, convert_mode);
+                                        ConvertReceiverMode convert_mode,
+                                        SpeculationMode speculation_mode) {
+  CallParameters parameters(arity, frequency, feedback, convert_mode,
+                            speculation_mode);
   return new (zone()) Operator1<CallParameters>(   // --
       IrOpcode::kJSCall, Operator::kNoProperties,  // opcode
       "JSCall",                                    // name
@@ -781,9 +774,10 @@ const Operator* JSOperatorBuilder::CallWithArrayLike(CallFrequency frequency) {
 }
 
 const Operator* JSOperatorBuilder::CallWithSpread(
-    uint32_t arity, CallFrequency frequency, VectorSlotPair const& feedback) {
+    uint32_t arity, CallFrequency frequency, VectorSlotPair const& feedback,
+    SpeculationMode speculation_mode) {
   CallParameters parameters(arity, frequency, feedback,
-                            ConvertReceiverMode::kAny);
+                            ConvertReceiverMode::kAny, speculation_mode);
   return new (zone()) Operator1<CallParameters>(             // --
       IrOpcode::kJSCallWithSpread, Operator::kNoProperties,  // opcode
       "JSCallWithSpread",                                    // name
@@ -1167,6 +1161,10 @@ const Operator* JSOperatorBuilder::CreateBlockContext(
       1, 1, 1, 1, 1, 2,                                          // counts
       scope_info);                                               // parameter
 }
+
+#undef BINARY_OP_LIST
+#undef CACHED_OP_LIST
+#undef COMPARE_OP_LIST
 
 }  // namespace compiler
 }  // namespace internal

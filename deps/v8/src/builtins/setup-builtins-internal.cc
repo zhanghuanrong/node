@@ -107,7 +107,11 @@ Code* BuildWithCodeStubAssemblerJS(Isolate* isolate, int32_t builtin_index,
   // Canonicalize handles, so that we can share constant pool entries pointing
   // to code targets without dereferencing their handles.
   CanonicalHandleScope canonical(isolate);
-  Zone zone(isolate->allocator(), ZONE_NAME);
+
+  SegmentSize segment_size = isolate->serializer_enabled()
+                                 ? SegmentSize::kLarge
+                                 : SegmentSize::kDefault;
+  Zone zone(isolate->allocator(), ZONE_NAME, segment_size);
   const int argc_with_recv =
       (argc == SharedFunctionInfo::kDontAdaptArgumentsSentinel) ? 0 : argc + 1;
   compiler::CodeAssemblerState state(isolate, &zone, argc_with_recv,
@@ -127,7 +131,10 @@ Code* BuildWithCodeStubAssemblerCS(Isolate* isolate, int32_t builtin_index,
   // Canonicalize handles, so that we can share constant pool entries pointing
   // to code targets without dereferencing their handles.
   CanonicalHandleScope canonical(isolate);
-  Zone zone(isolate->allocator(), ZONE_NAME);
+  SegmentSize segment_size = isolate->serializer_enabled()
+                                 ? SegmentSize::kLarge
+                                 : SegmentSize::kDefault;
+  Zone zone(isolate->allocator(), ZONE_NAME, segment_size);
   // The interface descriptor with given key must be initialized at this point
   // and this construction just queries the details from the descriptors table.
   CallInterfaceDescriptor descriptor(isolate, interface_descriptor);
@@ -179,7 +186,7 @@ void SetupIsolateDelegate::ReplacePlaceholders(Isolate* isolate) {
         if (!target->is_builtin()) continue;
         Code* new_target =
             Code::cast(builtins->builtins_[target->builtin_index()]);
-        rinfo->set_target_address(isolate, new_target->instruction_start(),
+        rinfo->set_target_address(new_target->instruction_start(),
                                   UPDATE_WRITE_BARRIER, SKIP_ICACHE_FLUSH);
       } else {
         DCHECK(RelocInfo::IsEmbeddedObject(rinfo->rmode()));
@@ -195,7 +202,7 @@ void SetupIsolateDelegate::ReplacePlaceholders(Isolate* isolate) {
       flush_icache = true;
     }
     if (flush_icache) {
-      Assembler::FlushICache(isolate, code->instruction_start(),
+      Assembler::FlushICache(code->instruction_start(),
                              code->instruction_size());
     }
   }

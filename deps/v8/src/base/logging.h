@@ -20,23 +20,13 @@
 V8_BASE_EXPORT V8_NOINLINE void V8_Dcheck(const char* file, int line,
                                           const char* message);
 
-// The FATAL, UNREACHABLE and UNIMPLEMENTED macros are useful during
-// development, but they should not be relied on in the final product.
 #ifdef DEBUG
-#define FATAL(msg)                              \
-  V8_Fatal(__FILE__, __LINE__, "%s", (msg))
-#define UNIMPLEMENTED()                         \
-  V8_Fatal(__FILE__, __LINE__, "unimplemented code")
-#define UNREACHABLE()                           \
-  V8_Fatal(__FILE__, __LINE__, "unreachable code")
+#define FATAL(...) V8_Fatal(__FILE__, __LINE__, __VA_ARGS__)
 #else
-#define FATAL(msg)                              \
-  V8_Fatal("", 0, "%s", (msg))
-#define UNIMPLEMENTED()                         \
-  V8_Fatal("", 0, "unimplemented code")
-#define UNREACHABLE() V8_Fatal("", 0, "unreachable code")
+#define FATAL(...) V8_Fatal("", 0, __VA_ARGS__)
 #endif
-
+#define UNIMPLEMENTED() FATAL("unimplemented code")
+#define UNREACHABLE() FATAL("unreachable code")
 
 namespace v8 {
 namespace base {
@@ -54,11 +44,11 @@ V8_BASE_EXPORT void SetDcheckFunction(void (*dcheck_Function)(const char*, int,
 //
 // We make sure CHECK et al. always evaluates their arguments, as
 // doing CHECK(FunctionWithSideEffect()) is a common idiom.
-#define CHECK_WITH_MSG(condition, message)                        \
-  do {                                                            \
-    if (V8_UNLIKELY(!(condition))) {                              \
-      V8_Fatal(__FILE__, __LINE__, "Check failed: %s.", message); \
-    }                                                             \
+#define CHECK_WITH_MSG(condition, message) \
+  do {                                     \
+    if (V8_UNLIKELY(!(condition))) {       \
+      FATAL("Check failed: %s.", message); \
+    }                                      \
   } while (0)
 #define CHECK(condition) CHECK_WITH_MSG(condition, #condition)
 
@@ -80,7 +70,7 @@ V8_BASE_EXPORT void SetDcheckFunction(void (*dcheck_Function)(const char*, int,
             typename ::v8::base::pass_value_or_ref<decltype(lhs)>::type,  \
             typename ::v8::base::pass_value_or_ref<decltype(rhs)>::type>( \
             (lhs), (rhs), #lhs " " #op " " #rhs)) {                       \
-      V8_Fatal(__FILE__, __LINE__, "Check failed: %s.", _msg->c_str());   \
+      FATAL("Check failed: %s.", _msg->c_str());                          \
       delete _msg;                                                        \
     }                                                                     \
   } while (0)

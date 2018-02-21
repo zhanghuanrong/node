@@ -89,6 +89,10 @@ MaybeHandle<Context> Snapshot::NewContextFromSnapshot(
 
 // static
 Code* Snapshot::DeserializeBuiltin(Isolate* isolate, int builtin_id) {
+  if (FLAG_trace_lazy_deserialization) {
+    PrintF("Lazy-deserializing builtin %s\n", Builtins::name(builtin_id));
+  }
+
   base::ElapsedTimer timer;
   if (FLAG_profile_deserialization) timer.Start();
 
@@ -116,9 +120,33 @@ Code* Snapshot::DeserializeBuiltin(Isolate* isolate, int builtin_id) {
 }
 
 // static
+void Snapshot::EnsureAllBuiltinsAreDeserialized(Isolate* isolate) {
+  if (!FLAG_lazy_deserialization) return;
+
+  Builtins* builtins = isolate->builtins();
+  for (int i = 0; i < Builtins::builtin_count; i++) {
+    if (!Builtins::IsLazy(i)) continue;
+
+    DCHECK_NE(Builtins::kDeserializeLazy, i);
+    Code* code = builtins->builtin(i);
+    if (code->builtin_index() == Builtins::kDeserializeLazy) {
+      code = Snapshot::DeserializeBuiltin(isolate, i);
+    }
+
+    DCHECK_EQ(i, code->builtin_index());
+    DCHECK_EQ(code, builtins->builtin(i));
+  }
+}
+
+// static
 Code* Snapshot::DeserializeHandler(Isolate* isolate,
                                    interpreter::Bytecode bytecode,
                                    interpreter::OperandScale operand_scale) {
+  if (FLAG_trace_lazy_deserialization) {
+    PrintF("Lazy-deserializing handler %s\n",
+           interpreter::Bytecodes::ToString(bytecode, operand_scale).c_str());
+  }
+
   base::ElapsedTimer timer;
   if (FLAG_profile_deserialization) timer.Start();
 
@@ -139,7 +167,7 @@ Code* Snapshot::DeserializeHandler(Isolate* isolate,
   }
 
   if (isolate->logger()->is_logging_code_events() || isolate->is_profiling()) {
-    isolate->logger()->LogCodeObject(code);
+    isolate->logger()->LogBytecodeHandler(bytecode, operand_scale, code);
   }
 
   return code;
@@ -312,16 +340,16 @@ void Snapshot::CheckVersion(const v8::StartupData* data) {
   CHECK_LT(kVersionStringOffset + kVersionStringLength,
            static_cast<uint32_t>(data->raw_size));
   Version::GetString(Vector<char>(version, kVersionStringLength));
-  if (memcmp(version, data->data + kVersionStringOffset,
-             kVersionStringLength) != 0) {
-    V8_Fatal(__FILE__, __LINE__,
-             "Version mismatch between V8 binary and snapshot.\n"
-             "#   V8 binary version: %.*s\n"
-             "#    Snapshot version: %.*s\n"
-             "# The snapshot consists of %d bytes and contains %d context(s).",
-             kVersionStringLength, version, kVersionStringLength,
-             data->data + kVersionStringOffset, data->raw_size,
-             ExtractNumContexts(data));
+  if (strncmp(version, data->data + kVersionStringOffset,
+              kVersionStringLength) != 0) {
+    FATAL(
+        "Version mismatch between V8 binary and snapshot.\n"
+        "#   V8 binary version: %.*s\n"
+        "#    Snapshot version: %.*s\n"
+        "# The snapshot consists of %d bytes and contains %d context(s).",
+        kVersionStringLength, version, kVersionStringLength,
+        data->data + kVersionStringOffset, data->raw_size,
+        ExtractNumContexts(data));
   }
 }
 
@@ -358,10 +386,12 @@ SnapshotData::SnapshotData(const Serializer<AllocatorT>* serializer) {
 template SnapshotData::SnapshotData(
     const Serializer<DefaultSerializerAllocator>* serializer);
 
-Vector<const SerializedData::Reservation> SnapshotData::Reservations() const {
-  return Vector<const Reservation>(
-      reinterpret_cast<const Reservation*>(data_ + kHeaderSize),
-      GetHeaderValue(kNumReservationsOffset));
+std::vector<SerializedData::Reservation> SnapshotData::Reservations() const {
+  uint32_t size = GetHeaderValue(kNumReservationsOffset);
+  std::vector<SerializedData::Reservation> reservations(size);
+  memcpy(reservations.data(), data_ + kHeaderSize,
+         size * sizeof(SerializedData::Reservation));
+  return reservations;
 }
 
 Vector<const byte> SnapshotData::Payload() const {

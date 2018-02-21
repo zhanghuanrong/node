@@ -92,8 +92,6 @@ class Scavenger {
 
   void IterateAndScavengePromotedObject(HeapObject* target, int size);
 
-  void RecordCopiedObject(HeapObject* obj);
-
   static inline bool ContainsOnlyData(VisitorId visitor_id);
 
   Heap* const heap_;
@@ -119,8 +117,9 @@ class RootScavengeVisitor final : public RootVisitor {
   RootScavengeVisitor(Heap* heap, Scavenger* scavenger)
       : heap_(heap), scavenger_(scavenger) {}
 
-  void VisitRootPointer(Root root, Object** p) final;
-  void VisitRootPointers(Root root, Object** start, Object** end) final;
+  void VisitRootPointer(Root root, const char* description, Object** p) final;
+  void VisitRootPointers(Root root, const char* description, Object** start,
+                         Object** end) final;
 
  private:
   void ScavengePointer(Object** p);

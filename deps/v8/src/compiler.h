@@ -24,10 +24,6 @@ class CompilationJob;
 class JavaScriptFrame;
 class ParseInfo;
 class ScriptData;
-template <typename T>
-class ThreadedList;
-template <typename T>
-class ThreadedListZoneEntry;
 
 typedef std::forward_list<std::unique_ptr<CompilationJob>> CompilationJobList;
 
@@ -71,17 +67,12 @@ class V8_EXPORT_PRIVATE Compiler : public AllStatic {
   // offer this chance, optimized closure instantiation will not call this.
   static void PostInstantiation(Handle<JSFunction> function, PretenureFlag);
 
-  typedef ThreadedList<ThreadedListZoneEntry<FunctionLiteral*>>
-      EagerInnerFunctionLiterals;
-
   // Parser::Parse, then Compiler::Analyze.
   static bool ParseAndAnalyze(ParseInfo* parse_info,
                               Handle<SharedFunctionInfo> shared_info,
                               Isolate* isolate);
-  // Rewrite, analyze scopes, and renumber. If |eager_literals| is non-null, it
-  // is appended with inner function literals which should be eagerly compiled.
-  static bool Analyze(ParseInfo* parse_info,
-                      EagerInnerFunctionLiterals* eager_literals = nullptr);
+  // Rewrite and analyze scopes.
+  static bool Analyze(ParseInfo* parse_info);
 
   // ===========================================================================
   // The following family of methods instantiates new functions for scripts or
@@ -99,6 +90,14 @@ class V8_EXPORT_PRIVATE Compiler : public AllStatic {
       ParseRestriction restriction, int parameters_end_pos,
       int eval_scope_position, int eval_position, int line_offset = 0,
       int column_offset = 0, Handle<Object> script_name = Handle<Object>(),
+      ScriptOriginOptions options = ScriptOriginOptions());
+
+  // Create a function that results from wrapping |source| in a function,
+  // with |arguments| being a list of parameters for that function.
+  MUST_USE_RESULT static MaybeHandle<JSFunction> GetWrappedFunction(
+      Handle<String> source, Handle<FixedArray> arguments,
+      Handle<Context> context, int line_offset = 0, int column_offset = 0,
+      Handle<Object> script_name = Handle<Object>(),
       ScriptOriginOptions options = ScriptOriginOptions());
 
   // Returns true if the embedder permits compiling the given source string in

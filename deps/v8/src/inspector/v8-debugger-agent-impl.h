@@ -2,9 +2,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#ifndef V8_INSPECTOR_V8DEBUGGERAGENTIMPL_H_
-#define V8_INSPECTOR_V8DEBUGGERAGENTIMPL_H_
+#ifndef V8_INSPECTOR_V8_DEBUGGER_AGENT_IMPL_H_
+#define V8_INSPECTOR_V8_DEBUGGER_AGENT_IMPL_H_
 
+#include <deque>
 #include <vector>
 
 #include "src/base/macros.h"
@@ -156,6 +157,7 @@ class V8DebuggerAgentImpl : public protocol::Debugger::Backend {
       std::unique_ptr<protocol::Array<protocol::Debugger::CallFrame>>*);
   std::unique_ptr<protocol::Runtime::StackTrace> currentAsyncStackTrace();
   std::unique_ptr<protocol::Runtime::StackTraceId> currentExternalStackTrace();
+  std::unique_ptr<protocol::Runtime::StackTraceId> currentScheduledAsyncCall();
 
   void setPauseOnExceptionsImpl(int);
 
@@ -191,6 +193,9 @@ class V8DebuggerAgentImpl : public protocol::Debugger::Backend {
   BreakpointIdToDebuggerBreakpointIdsMap m_breakpointIdToDebuggerBreakpointIds;
   DebuggerBreakpointIdToBreakpointIdMap m_debuggerBreakpointIdToBreakpointId;
 
+  std::deque<String16> m_failedToParseAnonymousScriptIds;
+  void cleanupOldFailedToParseAnonymousScriptsIfNeeded();
+
   using BreakReason =
       std::pair<String16, std::unique_ptr<protocol::DictionaryValue>>;
   std::vector<BreakReason> m_breakReason;
@@ -214,4 +219,4 @@ String16 scopeType(v8::debug::ScopeIterator::ScopeType type);
 
 }  // namespace v8_inspector
 
-#endif  // V8_INSPECTOR_V8DEBUGGERAGENTIMPL_H_
+#endif  // V8_INSPECTOR_V8_DEBUGGER_AGENT_IMPL_H_
