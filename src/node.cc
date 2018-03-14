@@ -274,6 +274,11 @@ static double prog_start_time;
 static Mutex node_isolate_mutex;
 static v8::Isolate* node_isolate;
 
+static int main_argc;
+static char** main_argv;
+static int main_exec_argc;
+static const char** main_exec_argv;
+
 node::DebugOptions debug_options;
 
 static struct {
@@ -4674,11 +4679,22 @@ Local<Context> NewContext(Isolate* isolate,
 }
 
 
+void GetNodeMainArgments(
+    int & argc, char** & argv,
+    int & exec_argc, const char** & exec_argv) {
+  argc = main_argc;
+  argv = main_argv;
+  exec_argc = main_exec_argc;
+  exec_argv = main_exec_argv;
+}
+
+
 inline int Start(Isolate* isolate, IsolateData* isolate_data,
                  int argc, const char* const* argv,
                  int exec_argc, const char* const* exec_argv) {
   HandleScope handle_scope(isolate);
   Local<Context> context = NewContext(isolate);
+  context->SetSecurityToken(v8::Undefined(isolate));
   Context::Scope context_scope(context);
   Environment env(isolate_data, context);
   CHECK_EQ(0, uv_key_create(&thread_local_env));
@@ -4707,7 +4723,7 @@ inline int Start(Isolate* isolate, IsolateData* isolate_data,
   env.set_trace_sync_io(trace_sync_io);
 
   {
-    SealHandleScope seal(isolate);
+    // SealHandleScope seal(isolate);
     bool more;
     PERFORMANCE_MARK(&env, LOOP_START);
     do {
@@ -4744,9 +4760,11 @@ inline int Start(Isolate* isolate, IsolateData* isolate_data,
   return exit_code;
 }
 
-inline int Start(uv_loop_t* event_loop,
+int Start(void* event_loop,
                  int argc, const char* const* argv,
-                 int exec_argc, const char* const* exec_argv) {
+          int exec_argc, const char* const* exec_argv,
+          bool is_main) {
+  uv_loop_t* the_event_loop = static_cast<uv_loop_t*>(event_loop);
   Isolate::CreateParams params;
   ArrayBufferAllocator allocator;
   params.array_buffer_allocator = &allocator;
@@ -4763,7 +4781,7 @@ inline int Start(uv_loop_t* event_loop,
   isolate->SetAutorunMicrotasks(false);
   isolate->SetFatalErrorHandler(OnFatalError);
 
-  {
+  if (is_main) {
     Mutex::ScopedLock scoped_lock(node_isolate_mutex);
     CHECK_EQ(node_isolate, nullptr);
     node_isolate = isolate;
@@ -4776,7 +4794,7 @@ inline int Start(uv_loop_t* event_loop,
     HandleScope handle_scope(isolate);
     IsolateData isolate_data(
         isolate,
-        event_loop,
+        the_event_loop,
         v8_platform.Platform(),
         allocator.zero_fill_field());
     if (track_heap_objects) {
@@ -4785,7 +4803,7 @@ inline int Start(uv_loop_t* event_loop,
     exit_code = Start(isolate, &isolate_data, argc, argv, exec_argc, exec_argv);
   }
 
-  {
+if (is_main) {
     Mutex::ScopedLock scoped_lock(node_isolate_mutex);
     CHECK_EQ(node_isolate, isolate);
     node_isolate = nullptr;
@@ -4838,8 +4856,16 @@ int Start(int argc, char** argv) {
   V8::Initialize();
   node::performance::performance_v8_start = PERFORMANCE_NOW();
   v8_initialized = true;
+
+  {
+    main_argc = argc;
+    main_argv = argv;
+    main_exec_argc = exec_argc;
+    main_exec_argv = exec_argv;
+  }
+
   const int exit_code =
-      Start(uv_default_loop(), argc, argv, exec_argc, exec_argv);
+      Start(static_cast<void*>(uv_default_loop()), argc, argv, exec_argc, exec_argv, true);
   if (trace_enabled) {
     v8_platform.StopTracingAgent();
   }

@@ -206,7 +206,19 @@ NODE_EXTERN extern bool force_fips_crypto;
 # endif
 #endif
 
+// This Start can be called only once per process.
 NODE_EXTERN int Start(int argc, char *argv[]);
+
+NODE_EXTERN void GetNodeMainArgments(
+    int & argc, char** & argv,
+    int & exec_argc, const char** & exec_argv);
+
+// This Start can be call multiple times with "is_main = false" per process.
+NODE_EXTERN int Start(void* event_loop,
+                      int argc, const char* const* argv,
+                      int exec_argc, const char* const* exec_argv,
+                      bool is_main = false);
+
 NODE_EXTERN void Init(int* argc,
                       const char** argv,
                       int* exec_argc,
