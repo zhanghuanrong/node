@@ -2227,6 +2227,10 @@ inline InitializerCallback GetInitializerCallback(DLib* dlib) {
   return reinterpret_cast<InitializerCallback>(dlib->GetSymbolAddress(name));
 }
 
+// TODO: Just a temporal fix. Lot of others need to be figure out later, like
+// synchronization, etc.
+static std::map<std::string, node_module*> addon_modules;
+
 // DLOpen is process.dlopen(module, filename, flags).
 // Used to load 'module.node' dynamically shared objects.
 //
@@ -2265,7 +2269,7 @@ static void DLOpen(const FunctionCallbackInfo<Value>& args) {
   // Objects containing v14 or later modules will have registered themselves
   // on the pending list.  Activate all of them now.  At present, only one
   // module per object is supported.
-  node_module* const mp = modpending;
+  node_module* mp = modpending;
   modpending = nullptr;
 
   if (!is_opened) {
@@ -2280,14 +2284,23 @@ static void DLOpen(const FunctionCallbackInfo<Value>& args) {
     return;
   }
 
+  // TODO: temporal work around. Lock and wait may need here, and more fundementals.
   if (mp == nullptr) {
-    if (auto callback = GetInitializerCallback(&dlib)) {
-      callback(exports, module, context);
-    } else {
-      dlib.Close();
-      env->ThrowError("Module did not self-register.");
+    if (addon_modules.find(dlib.filename_) != addon_modules.end()) {
+      mp = addon_modules[dlib.filename_];
     }
-    return;
+    if (mp == nullptr) {
+      if (auto callback = GetInitializerCallback(&dlib)) {
+        callback(exports, module, context);
+      } else {
+        dlib.Close();
+        env->ThrowError("Module did not self-register.");
+      }
+      return;
+    }
+  }
+  else {
+    addon_modules[dlib.filename_] = mp;
   }
 
   // -1 is used for N-API modules
