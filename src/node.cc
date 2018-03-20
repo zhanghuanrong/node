@@ -4712,7 +4712,6 @@ inline int Start(Isolate* isolate, IsolateData* isolate_data,
   context->SetSecurityToken(v8::Undefined(isolate));
   Context::Scope context_scope(context);
   Environment env(isolate_data, context);
-  CHECK_EQ(0, uv_key_create(&thread_local_env));
   uv_key_set(&thread_local_env, &env);
   env.Start(argc, argv, exec_argc, exec_argv, v8_is_profiling);
 
@@ -4763,7 +4762,6 @@ inline int Start(Isolate* isolate, IsolateData* isolate_data,
 
   const int exit_code = EmitExit(&env);
   RunAtExit(&env);
-  uv_key_delete(&thread_local_env);
 
   v8_platform.DrainVMTasks(isolate);
   v8_platform.CancelVMTasks(isolate);
@@ -4800,6 +4798,7 @@ int Start(void* event_loop,
     Mutex::ScopedLock scoped_lock(node_isolate_mutex);
     CHECK_EQ(node_isolate, nullptr);
     node_isolate = isolate;
+    CHECK_EQ(0, uv_key_create(&thread_local_env));
   }
 
   int exit_code;
@@ -4820,6 +4819,8 @@ int Start(void* event_loop,
 
 if (is_main) {
     Mutex::ScopedLock scoped_lock(node_isolate_mutex);
+    // yulong: TODO - run uv_key_delete() when all isolates exit
+    uv_key_delete(&thread_local_env);
     CHECK_EQ(node_isolate, isolate);
     node_isolate = nullptr;
   }
