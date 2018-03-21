@@ -2506,11 +2506,6 @@ struct DLib {
 #endif  // !__POSIX__
 };
 
-
-// TODO: Just a temporal fix. Lot of others need to be figure out later, like
-// synchronization, etc.
-static std::map<std::string, node_module*> addon_modules;
-
 // DLOpen is process.dlopen(module, filename, flags).
 // Used to load 'module.node' dynamically shared objects.
 //
@@ -2543,7 +2538,7 @@ static void DLOpen(const FunctionCallbackInfo<Value>& args) {
   // Objects containing v14 or later modules will have registered themselves
   // on the pending list.  Activate all of them now.  At present, only one
   // module per object is supported.
-  node_module* mp = modpending;
+  node_module* const mp = modpending;
   modpending = nullptr;
 
   if (!is_opened) {
@@ -2558,21 +2553,11 @@ static void DLOpen(const FunctionCallbackInfo<Value>& args) {
     return;
   }
 
-  // TODO: temporal work around. Lock and wait may need here, and more fundementals.
   if (mp == nullptr) {
-    if (addon_modules.find(dlib.filename_) != addon_modules.end()) {
-      mp = addon_modules[dlib.filename_];
-    }
-    if (mp == nullptr) {
-      dlib.Close();
-      env->ThrowError("Module did not self-register.");
-      return;
-    }
+    dlib.Close();
+    env->ThrowError("Module did not self-register.");
+    return;
   }
-  else {
-    addon_modules[dlib.filename_] = mp;
-  }
-
   if (mp->nm_version == -1) {
     if (env->EmitNapiWarning()) {
       if (ProcessEmitWarning(env, "N-API is an experimental feature and could "
