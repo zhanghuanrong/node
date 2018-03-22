@@ -87,6 +87,7 @@
 
 #include <string>
 #include <vector>
+#include <iostream>
 
 #if defined(NODE_HAVE_I18N_SUPPORT)
 #include <unicode/uvernum.h>
@@ -2546,7 +2547,6 @@ struct DLib : public std::enable_shared_from_this<DLib> {
   void AddEnvironment(Environment* env) {
     if (users_.count(env) > 0) return;
     users_.insert(env);
-    if (env->is_main_thread()) return;
     struct cleanup_hook_data {
       std::shared_ptr<DLib> info;
       Environment* env;
@@ -2639,15 +2639,14 @@ static void DLOpen(const FunctionCallbackInfo<Value>& args) {
       return;
     }
 
-  if (mp == nullptr) {
-    env->ThrowError("Module did not self-register.");
-    return;
-  }
-  if (mp->nm_version == -1) {
-    if (env->EmitNapiWarning()) {
-      if (ProcessEmitWarning(env, "N-API is an experimental feature and could "
-                                  "change at any time.").IsNothing()) {
-        return;
+    if (mp == nullptr) {
+      env->ThrowError("Module did not self-register.");
+      return;
+    }
+    if (mp->nm_version == -1) {
+      if (env->EmitNapiWarning()) {
+        ProcessEmitWarning(env, "N-API is an experimental feature and could "
+                           "change at any time.");
       }
     } else if (mp->nm_version != NODE_MODULE_VERSION) {
       char errmsg[1024];
