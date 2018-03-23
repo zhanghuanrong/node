@@ -4715,6 +4715,7 @@ inline int Start(Isolate* isolate, IsolateData* isolate_data,
   uv_key_set(&thread_local_env, &env);
   env.Start(argc, argv, exec_argc, exec_argv, v8_is_profiling);
 
+  // TODO: temperal work around crashing before we dive into inspector.
   if (env.event_loop() == uv_default_loop()) {
     const char* path = argc > 1 ? argv[1] : nullptr;
     StartInspector(&env, path, debug_options);
