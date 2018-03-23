@@ -4715,11 +4715,13 @@ inline int Start(Isolate* isolate, IsolateData* isolate_data,
   uv_key_set(&thread_local_env, &env);
   env.Start(argc, argv, exec_argc, exec_argv, v8_is_profiling);
 
-  const char* path = argc > 1 ? argv[1] : nullptr;
-  StartInspector(&env, path, debug_options);
+  if (env.event_loop() == uv_default_loop()) {
+    const char* path = argc > 1 ? argv[1] : nullptr;
+    StartInspector(&env, path, debug_options);
 
-  if (debug_options.inspector_enabled() && !v8_platform.InspectorStarted(&env))
-    return 12;  // Signal internal error.
+    if (debug_options.inspector_enabled() && !v8_platform.InspectorStarted(&env))
+      return 12;  // Signal internal error.
+  }
 
   env.set_abort_on_uncaught_exception(abort_on_uncaught_exception);
 
