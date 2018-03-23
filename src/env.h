@@ -676,6 +676,10 @@ class Environment {
   inline bool inside_should_not_abort_on_uncaught_scope() const;
 
   static inline Environment* ForAsyncHooks(AsyncHooks* hooks);
+  
+  inline void AddCleanupHook(void (*fn)(void*), void* arg);
+  inline void RemoveCleanupHook(void (*fn)(void*), void* arg);
+  void RunCleanup();
 
  private:
   inline void ThrowError(v8::Local<v8::Value> (*fun)(v8::Local<v8::String>),
@@ -745,6 +749,15 @@ class Environment {
   std::vector<NativeImmediateCallback> native_immediate_callbacks_;
   void RunAndClearNativeImmediates();
   static void CheckImmediate(uv_check_t* handle);
+  
+  struct CleanupHookCallback {
+    void (*fun_)(void*);
+    void* arg_;
+    int64_t insertion_order_counter_;
+  };
+
+  std::unordered_map<void*, std::vector<CleanupHookCallback>> cleanup_hooks_;
+  int64_t cleanup_hook_counter_ = 0;
 
   static void EnvPromiseHook(v8::PromiseHookType type,
                              v8::Local<v8::Promise> promise,
