@@ -4768,7 +4768,10 @@ inline int Start(Isolate* isolate, IsolateData* isolate_data,
 
   v8_platform.DrainVMTasks(isolate);
   v8_platform.CancelVMTasks(isolate);
-  WaitForInspectorDisconnect(&env);
+  // Together with the above temp work around, temp fix the destructor.
+  if (env.event_loop() == uv_default_loop()) {
+    WaitForInspectorDisconnect(&env);
+  }
 #if defined(LEAK_SANITIZER)
   __lsan_do_leak_check();
 #endif
