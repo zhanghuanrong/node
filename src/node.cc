@@ -4837,7 +4837,7 @@ int Start(void* event_loop,
             node_isolate_foreground_task_runner = foreground_task_runner;
             node_isolate_background_task_runner = background_task_runner;
         }
-        else if (setupCallback) {
+        if (setupCallback) {
             setupCallback(foreground_task_runner, background_task_runner);      
         }
     }
