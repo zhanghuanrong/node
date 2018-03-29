@@ -217,7 +217,12 @@ NODE_EXTERN void GetNodeMainArgments(
 NODE_EXTERN int Start(void* event_loop,
                       int argc, const char* const* argv,
                       int exec_argc, const char* const* exec_argv,
-                      bool is_main = false);
+                      bool is_main = false,
+                      std::function<void(v8::TaskRunner*, v8::TaskRunner*)> setupCallback =
+                        std::function<void(v8::TaskRunner*, v8::TaskRunner*)>());
+
+NODE_EXTERN v8::TaskRunner* GetNodeIsolateForegroundTaskRunner();
+NODE_EXTERN v8::TaskRunner* GetNodeIsolateBackgroundTaskRunner();
 
 NODE_EXTERN void Init(int* argc,
                       const char** argv,

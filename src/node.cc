@@ -273,6 +273,8 @@ static double prog_start_time;
 
 static Mutex node_isolate_mutex;
 static v8::Isolate* node_isolate;
+static v8::TaskRunner* node_isolate_foreground_task_runner;
+static v8::TaskRunner* node_isolate_background_task_runner;
 
 static int main_argc;
 static char** main_argv;
@@ -4703,10 +4705,17 @@ void GetNodeMainArgments(
   exec_argv = main_exec_argv;
 }
 
+v8::TaskRunner* GetNodeIsolateForegroundTaskRunner() {
+  return node_isolate_foreground_task_runner;
+}
+v8::TaskRunner* GetNodeIsolateBackgroundTaskRunner() {
+  return node_isolate_background_task_runner;
+}
 
 inline int Start(Isolate* isolate, IsolateData* isolate_data,
                  int argc, const char* const* argv,
-                 int exec_argc, const char* const* exec_argv) {
+                 int exec_argc, const char* const* exec_argv,
+                 bool is_main) {
   HandleScope handle_scope(isolate);
   Local<Context> context = NewContext(isolate);
   context->SetSecurityToken(v8::Undefined(isolate));
@@ -4715,11 +4724,13 @@ inline int Start(Isolate* isolate, IsolateData* isolate_data,
   uv_key_set(&thread_local_env, &env);
   env.Start(argc, argv, exec_argc, exec_argv, v8_is_profiling);
 
-  const char* path = argc > 1 ? argv[1] : nullptr;
-  StartInspector(&env, path, debug_options);
+  if (is_main) {
+    const char* path = argc > 1 ? argv[1] : nullptr;
+    StartInspector(&env, path, debug_options);
 
-  if (debug_options.inspector_enabled() && !v8_platform.InspectorStarted(&env))
+    if (debug_options.inspector_enabled() && !v8_platform.InspectorStarted(&env))
     return 12;  // Signal internal error.
+  }
 
   env.set_abort_on_uncaught_exception(abort_on_uncaught_exception);
 
@@ -4733,7 +4744,7 @@ inline int Start(Isolate* isolate, IsolateData* isolate_data,
     LoadEnvironment(&env);
     env.async_hooks()->pop_async_id(1);
   }
-
+  
   env.set_trace_sync_io(trace_sync_io);
 
   {
@@ -4765,7 +4776,9 @@ inline int Start(Isolate* isolate, IsolateData* isolate_data,
 
   v8_platform.DrainVMTasks(isolate);
   v8_platform.CancelVMTasks(isolate);
-  WaitForInspectorDisconnect(&env);
+  if (is_main) {
+    WaitForInspectorDisconnect(&env);
+  }
 #if defined(LEAK_SANITIZER)
   __lsan_do_leak_check();
 #endif
@@ -4774,9 +4787,10 @@ inline int Start(Isolate* isolate, IsolateData* isolate_data,
 }
 
 int Start(void* event_loop,
-                 int argc, const char* const* argv,
+          int argc, const char* const* argv,
           int exec_argc, const char* const* exec_argv,
-          bool is_main) {
+          bool is_main,
+          std::function<void(v8::TaskRunner*, v8::TaskRunner*)> setupCallback) {
   uv_loop_t* the_event_loop = static_cast<uv_loop_t*>(event_loop);
   Isolate::CreateParams params;
   ArrayBufferAllocator allocator;
@@ -4814,7 +4828,21 @@ int Start(void* event_loop,
     if (track_heap_objects) {
       isolate->GetHeapProfiler()->StartTrackingHeapObjects(true);
     }
-    exit_code = Start(isolate, &isolate_data, argc, argv, exec_argc, exec_argv);
+
+    NodePlatform* platform = v8_platform.Platform();
+    if (platform != nullptr) {
+        auto foreground_task_runner = platform->GetForegroundTaskRunner(isolate).get();
+        auto background_task_runner = platform->GetBackgroundTaskRunner(isolate).get();
+        if (is_main) {
+            node_isolate_foreground_task_runner = foreground_task_runner;
+            node_isolate_background_task_runner = background_task_runner;
+        }
+        else if (setupCallback) {
+            setupCallback(foreground_task_runner, background_task_runner);      
+        }
+    }
+
+    exit_code = Start(isolate, &isolate_data, argc, argv, exec_argc, exec_argv, is_main);
   }
 
 if (is_main) {
@@ -4881,7 +4909,8 @@ int Start(int argc, char** argv) {
   }
 
   const int exit_code =
-      Start(static_cast<void*>(uv_default_loop()), argc, argv, exec_argc, exec_argv, true);
+      Start(static_cast<void*>(uv_default_loop()),
+            argc, argv, exec_argc, exec_argv, true);
   if (trace_enabled) {
     v8_platform.StopTracingAgent();
   }
