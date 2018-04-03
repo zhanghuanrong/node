@@ -4805,7 +4805,7 @@ inline int Start(Isolate* isolate, IsolateData* isolate_data,
     StartInspector(&env, path, debug_options);
 
     if (debug_options.inspector_enabled() && !v8_platform.InspectorStarted(&env))
-    return 12;  // Signal internal error.
+      return 12;  // Signal internal error.
   }
 
   env.set_abort_on_uncaught_exception(abort_on_uncaught_exception);
