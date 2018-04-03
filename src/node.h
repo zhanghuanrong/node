@@ -217,7 +217,12 @@ NODE_EXTERN void GetNodeMainArgments(
 NODE_EXTERN int Start(void* event_loop,
                       int argc, const char* const* argv,
                       int exec_argc, const char* const* exec_argv,
-                      bool is_main = false);
+                      bool is_main = false,
+                      std::function<void(v8::TaskRunner*, v8::TaskRunner*)> setupCallback =
+                        std::function<void(v8::TaskRunner*, v8::TaskRunner*)>());
+
+NODE_EXTERN v8::TaskRunner* GetNodeIsolateForegroundTaskRunner();
+NODE_EXTERN v8::TaskRunner* GetNodeIsolateBackgroundTaskRunner();
 
 NODE_EXTERN void Init(int* argc,
                       const char** argv,
@@ -584,6 +589,19 @@ struct async_context {
 NODE_EXTERN void AddPromiseHook(v8::Isolate* isolate,
                                 promise_hook_func fn,
                                 void* arg);
+
+/* This is a lot like node::AtExit, except that the hooks added via this
+ * function are run before the AtExit ones and will always be registered
+ * for the current Environment instance.
+ * These functions are safe to use in an addon supporting multiple
+ * threads/isolates. */
+NODE_EXTERN void AddEnvironmentCleanupHook(v8::Isolate* isolate,
+                                           void (*fun)(void* arg),
+                                           void* arg);
+
+NODE_EXTERN void RemoveEnvironmentCleanupHook(v8::Isolate* isolate,
+                                              void (*fun)(void* arg),
+                                              void* arg);
 
 /* Returns the id of the current execution context. If the return value is
  * zero then no execution has been set. This will happen if the user handles

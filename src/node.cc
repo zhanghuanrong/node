@@ -273,6 +273,8 @@ static double prog_start_time;
 
 static Mutex node_isolate_mutex;
 static v8::Isolate* node_isolate;
+static v8::TaskRunner* node_isolate_foreground_task_runner;
+static v8::TaskRunner* node_isolate_background_task_runner;
 
 static int main_argc;
 static char** main_argv;
@@ -1209,6 +1211,22 @@ void AddPromiseHook(v8::Isolate* isolate, promise_hook_func fn, void* arg) {
   Environment* env = Environment::GetCurrent(isolate);
   env->AddPromiseHook(fn, arg);
 }
+
+void AddEnvironmentCleanupHook(v8::Isolate* isolate,
+                               void (*fun)(void* arg),
+                               void* arg) {
+  Environment* env = Environment::GetCurrent(isolate);
+  env->AddCleanupHook(fun, arg);
+}
+
+
+void RemoveEnvironmentCleanupHook(v8::Isolate* isolate,
+                                  void (*fun)(void* arg),
+                                  void* arg) {
+  Environment* env = Environment::GetCurrent(isolate);
+  env->RemoveCleanupHook(fun, arg);
+}
+
 
 CallbackScope::CallbackScope(Isolate* isolate,
                              Local<Object> object,
@@ -2464,11 +2482,28 @@ node_module* get_linked_module(const char* name) {
   return FindModule(modlist_linked, name, NM_F_LINKED);
 }
 
-struct DLib {
+namespace {
+
+Mutex dlib_mutex;
+
+struct DLib;
+
+std::unordered_map<std::string, std::shared_ptr<DLib>> dlopen_cache;
+std::unordered_map<decltype(uv_lib_t().handle), std::shared_ptr<DLib>>
+    handle_to_dlib;
+
+struct DLib : public std::enable_shared_from_this<DLib> {
   std::string filename_;
   std::string errmsg_;
-  void* handle_;
+  void* handle_ = nullptr;
   int flags_;
+  std::unordered_set<Environment*> users_;
+  node_module* own_info = nullptr;
+
+  DLib() {}
+  ~DLib() {
+    Close();
+  }
 
 #ifdef __POSIX__
   static const int kDefaultFlags = RTLD_LAZY;
@@ -2504,110 +2539,155 @@ struct DLib {
     uv_dlclose(&lib_);
   }
 #endif  // !__POSIX__
+
+  DLib(const DLib& other) = delete;
+  DLib(DLib&& other) = delete;
+  DLib& operator=(const DLib& other) = delete;
+  DLib& operator=(DLib&& other) = delete;
+
+  void AddEnvironment(Environment* env) {
+    if (users_.count(env) > 0) return;
+    users_.insert(env);
+    struct cleanup_hook_data {
+      std::shared_ptr<DLib> info;
+      Environment* env;
+    };
+    env->AddCleanupHook([](void* arg) {
+      Mutex::ScopedLock lock(dlib_mutex);
+      cleanup_hook_data* cbdata = static_cast<cleanup_hook_data*>(arg);
+      std::shared_ptr<DLib> info = cbdata->info;
+      info->users_.erase(cbdata->env);
+      delete cbdata;
+      if (info->users_.empty()) {
+        std::vector<std::string> filenames;
+
+        for (const auto& entry : dlopen_cache) {
+          if (entry.second == info)
+            filenames.push_back(entry.first);
+        }
+        for (const std::string& filename : filenames)
+          dlopen_cache.erase(filename);
+
+        handle_to_dlib.erase(info->handle_);
+      }
+    }, static_cast<void*>(new cleanup_hook_data { shared_from_this(), env }));
+  }
 };
 
-
-// TODO: Just a temporal fix. Lot of others need to be figure out later, like
-// synchronization, etc.
-static std::map<std::string, node_module*> addon_modules;
+}  // anonymous namespace
 
 // DLOpen is process.dlopen(module, filename, flags).
 // Used to load 'module.node' dynamically shared objects.
-//
-// FIXME(bnoordhuis) Not multi-context ready. TBD how to resolve the conflict
-// when two contexts try to load the same shared object. Maybe have a shadow
-// cache that's a plain C list or hash table that's shared across contexts?
 static void DLOpen(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
+  node_module* mp;
+  std::shared_ptr<DLib> dlib;
+  Local<Object> module = args[0]->ToObject(env->isolate());
 
-  CHECK_EQ(modpending, nullptr);
+  do {
+    Mutex::ScopedLock lock(dlib_mutex);
+    CHECK_EQ(modpending, nullptr);
 
-  if (args.Length() < 2) {
-    env->ThrowError("process.dlopen needs at least 2 arguments.");
-    return;
-  }
-
-  int32_t flags = DLib::kDefaultFlags;
-  if (args.Length() > 2 && !args[2]->Int32Value(env->context()).To(&flags)) {
-    return env->ThrowTypeError("flag argument must be an integer.");
-  }
-
-  Local<Object> module =
-      args[0]->ToObject(env->context()).ToLocalChecked();  // Cast
-  node::Utf8Value filename(env->isolate(), args[1]);  // Cast
-  DLib dlib;
-  dlib.filename_ = *filename;
-  dlib.flags_ = flags;
-  bool is_opened = dlib.Open();
-
-  // Objects containing v14 or later modules will have registered themselves
-  // on the pending list.  Activate all of them now.  At present, only one
-  // module per object is supported.
-  node_module* mp = modpending;
-  modpending = nullptr;
-
-  if (!is_opened) {
-    Local<String> errmsg = OneByteString(env->isolate(), dlib.errmsg_.c_str());
-    dlib.Close();
-#ifdef _WIN32
-    // Windows needs to add the filename into the error message
-    errmsg = String::Concat(errmsg,
-                            args[1]->ToString(env->context()).ToLocalChecked());
-#endif  // _WIN32
-    env->isolate()->ThrowException(Exception::Error(errmsg));
-    return;
-  }
-
-  // TODO: temporal work around. Lock and wait may need here, and more fundementals.
-  if (mp == nullptr) {
-    if (addon_modules.find(dlib.filename_) != addon_modules.end()) {
-      mp = addon_modules[dlib.filename_];
+    if (args.Length() < 2) {
+      env->ThrowError("process.dlopen needs at least 2 arguments.");
+      return;
     }
+
+    int32_t flags = DLib::kDefaultFlags;
+    if (args.Length() > 2 && !args[2]->Int32Value(env->context()).To(&flags)) {
+      return env->ThrowTypeError("flag argument must be an integer.");
+    }
+
+    Local<Object> module =
+        args[0]->ToObject(env->context()).ToLocalChecked();  // Cast
+    node::Utf8Value filename(env->isolate(), args[1]);  // Cast
+    auto it = dlopen_cache.find(*filename);
+
+    if (it != dlopen_cache.end()) {
+      dlib = it->second;
+      mp = dlib->own_info;
+      dlib->AddEnvironment(env);
+      break;
+    }
+
+    dlib = std::make_shared<DLib>();
+    dlib->filename_ = *filename;
+    dlib->flags_ = flags;
+    bool is_opened = dlib->Open();
+
+    if (is_opened && handle_to_dlib.count(dlib->handle_) > 0) {
+      dlib = handle_to_dlib[dlib->handle_];
+      mp = dlib->own_info;
+      dlib->AddEnvironment(env);
+      break;
+    }
+
+    // Objects containing v14 or later modules will have registered themselves
+    // on the pending list.  Activate all of them now.  At present, only one
+    // module per object is supported.
+    mp = modpending;
+    modpending = nullptr;
+
+    if (!is_opened) {
+      Local<String> errmsg =
+          OneByteString(env->isolate(), dlib->errmsg_.c_str());
+#ifdef _WIN32
+      // Windows needs to add the filename into the error message
+      errmsg = String::Concat(errmsg,
+                              args[1]->ToString(env->context()).ToLocalChecked());
+#endif  // _WIN32
+      env->isolate()->ThrowException(Exception::Error(errmsg));
+      return;
+    }
+
     if (mp == nullptr) {
-      dlib.Close();
       env->ThrowError("Module did not self-register.");
       return;
     }
-  }
-  else {
-    addon_modules[dlib.filename_] = mp;
-  }
-
-  if (mp->nm_version == -1) {
-    if (env->EmitNapiWarning()) {
-      if (ProcessEmitWarning(env, "N-API is an experimental feature and could "
-                                  "change at any time.").IsNothing()) {
-        dlib.Close();
-        return;
+    if (mp->nm_version == -1) {
+      if (env->EmitNapiWarning()) {
+        ProcessEmitWarning(env, "N-API is an experimental feature and could "
+                           "change at any time.");
       }
+    } else if (mp->nm_version != NODE_MODULE_VERSION) {
+      char errmsg[1024];
+      snprintf(errmsg,
+               sizeof(errmsg),
+               "The module '%s'"
+               "\nwas compiled against a different Node.js version using"
+               "\nNODE_MODULE_VERSION %d. This version of Node.js requires"
+               "\nNODE_MODULE_VERSION %d. Please try re-compiling or "
+               "re-installing\nthe module (for instance, using `npm rebuild` "
+               "or `npm install`).",
+               *filename, mp->nm_version, NODE_MODULE_VERSION);
+
+      // NOTE: `mp` is allocated inside of the shared library's memory,
+      // calling `dlclose` will deallocate it
+      env->ThrowError(errmsg);
+      return;
     }
-  } else if (mp->nm_version != NODE_MODULE_VERSION) {
-    char errmsg[1024];
-    snprintf(errmsg,
-             sizeof(errmsg),
-             "The module '%s'"
-             "\nwas compiled against a different Node.js version using"
-             "\nNODE_MODULE_VERSION %d. This version of Node.js requires"
-             "\nNODE_MODULE_VERSION %d. Please try re-compiling or "
-             "re-installing\nthe module (for instance, using `npm rebuild` "
-             "or `npm install`).",
-             *filename, mp->nm_version, NODE_MODULE_VERSION);
 
-    // NOTE: `mp` is allocated inside of the shared library's memory, calling
-    // `dlclose` will deallocate it
-    dlib.Close();
-    env->ThrowError(errmsg);
-    return;
-  }
-  if (mp->nm_flags & NM_F_BUILTIN) {
-    dlib.Close();
-    env->ThrowError("Built-in module self-registered.");
-    return;
-  }
+    if (mp->nm_flags & NM_F_BUILTIN) {
+      env->ThrowError("Built-in module self-registered.");
+      return;
+    }
 
-  mp->nm_dso_handle = dlib.handle_;
-  mp->nm_link = modlist_addon;
-  modlist_addon = mp;
+    if (mp->nm_context_register_func == nullptr &&
+        mp->nm_register_func == nullptr) {
+      env->ThrowError("Module has no declared entry point.");
+      return;
+    }
+
+    dlib->own_info = mp;
+    handle_to_dlib[dlib->handle_] = dlib;
+    dlopen_cache[*filename] = dlib;
+
+    dlib->AddEnvironment(env);
+
+    mp->nm_dso_handle = dlib->handle_;
+    mp->nm_link = modlist_addon;
+    modlist_addon = mp;
+  } while (false);
 
   Local<String> exports_string = env->exports_string();
   MaybeLocal<Value> maybe_exports =
@@ -2615,7 +2695,6 @@ static void DLOpen(const FunctionCallbackInfo<Value>& args) {
 
   if (maybe_exports.IsEmpty() ||
       maybe_exports.ToLocalChecked()->ToObject(env->context()).IsEmpty()) {
-    dlib.Close();
     return;
   }
 
@@ -2628,7 +2707,6 @@ static void DLOpen(const FunctionCallbackInfo<Value>& args) {
   } else if (mp->nm_register_func != nullptr) {
     mp->nm_register_func(exports, module, mp->nm_priv);
   } else {
-    dlib.Close();
     env->ThrowError("Module has no declared entry point.");
     return;
   }
@@ -4703,10 +4781,17 @@ void GetNodeMainArgments(
   exec_argv = main_exec_argv;
 }
 
+v8::TaskRunner* GetNodeIsolateForegroundTaskRunner() {
+  return node_isolate_foreground_task_runner;
+}
+v8::TaskRunner* GetNodeIsolateBackgroundTaskRunner() {
+  return node_isolate_background_task_runner;
+}
 
 inline int Start(Isolate* isolate, IsolateData* isolate_data,
                  int argc, const char* const* argv,
-                 int exec_argc, const char* const* exec_argv) {
+                 int exec_argc, const char* const* exec_argv,
+                 bool is_main) {
   HandleScope handle_scope(isolate);
   Local<Context> context = NewContext(isolate);
   context->SetSecurityToken(v8::Undefined(isolate));
@@ -4715,8 +4800,7 @@ inline int Start(Isolate* isolate, IsolateData* isolate_data,
   uv_key_set(&thread_local_env, &env);
   env.Start(argc, argv, exec_argc, exec_argv, v8_is_profiling);
 
-  // TODO: temperal work around crashing before we dive into inspector.
-  if (env.event_loop() == uv_default_loop()) {
+  if (is_main) {
     const char* path = argc > 1 ? argv[1] : nullptr;
     StartInspector(&env, path, debug_options);
 
@@ -4736,7 +4820,7 @@ inline int Start(Isolate* isolate, IsolateData* isolate_data,
     LoadEnvironment(&env);
     env.async_hooks()->pop_async_id(1);
   }
-
+  
   env.set_trace_sync_io(trace_sync_io);
 
   {
@@ -4764,12 +4848,13 @@ inline int Start(Isolate* isolate, IsolateData* isolate_data,
   env.set_trace_sync_io(false);
 
   const int exit_code = EmitExit(&env);
+
+  env.RunCleanup();
   RunAtExit(&env);
 
   v8_platform.DrainVMTasks(isolate);
   v8_platform.CancelVMTasks(isolate);
-  // Together with the above temp work around, temp fix the destructor.
-  if (env.event_loop() == uv_default_loop()) {
+  if (is_main) {
     WaitForInspectorDisconnect(&env);
   }
 #if defined(LEAK_SANITIZER)
@@ -4780,9 +4865,10 @@ inline int Start(Isolate* isolate, IsolateData* isolate_data,
 }
 
 int Start(void* event_loop,
-                 int argc, const char* const* argv,
+          int argc, const char* const* argv,
           int exec_argc, const char* const* exec_argv,
-          bool is_main) {
+          bool is_main,
+          std::function<void(v8::TaskRunner*, v8::TaskRunner*)> setupCallback) {
   uv_loop_t* the_event_loop = static_cast<uv_loop_t*>(event_loop);
   Isolate::CreateParams params;
   ArrayBufferAllocator allocator;
@@ -4820,7 +4906,21 @@ int Start(void* event_loop,
     if (track_heap_objects) {
       isolate->GetHeapProfiler()->StartTrackingHeapObjects(true);
     }
-    exit_code = Start(isolate, &isolate_data, argc, argv, exec_argc, exec_argv);
+
+    NodePlatform* platform = v8_platform.Platform();
+    if (platform != nullptr) {
+        auto foreground_task_runner = platform->GetForegroundTaskRunner(isolate).get();
+        auto background_task_runner = platform->GetBackgroundTaskRunner(isolate).get();
+        if (is_main) {
+            node_isolate_foreground_task_runner = foreground_task_runner;
+            node_isolate_background_task_runner = background_task_runner;
+        }
+        if (setupCallback) {
+            setupCallback(foreground_task_runner, background_task_runner);      
+        }
+    }
+
+    exit_code = Start(isolate, &isolate_data, argc, argv, exec_argc, exec_argv, is_main);
   }
 
 if (is_main) {
@@ -4887,7 +4987,8 @@ int Start(int argc, char** argv) {
   }
 
   const int exit_code =
-      Start(static_cast<void*>(uv_default_loop()), argc, argv, exec_argc, exec_argv, true);
+      Start(static_cast<void*>(uv_default_loop()),
+            argc, argv, exec_argc, exec_argv, true);
   if (trace_enabled) {
     v8_platform.StopTracingAgent();
   }
