@@ -87,7 +87,6 @@
 
 #include <string>
 #include <vector>
-#include <iostream>
 
 #if defined(NODE_HAVE_I18N_SUPPORT)
 #include <unicode/uvernum.h>
