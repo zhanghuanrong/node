@@ -178,6 +178,11 @@ NODE_EXTERN v8::Local<v8::Value> MakeCallback(
 #include <assert.h>
 #include <stdint.h>
 
+// yulongw: TODO - it looks that this header file does not depend on STL before we adding
+//                 std::function as parameters in Start(). we should remove this dependency
+//                 and revise this implementation.
+#include <functional>
+
 #ifndef NODE_STRINGIFY
 #define NODE_STRINGIFY(n) NODE_STRINGIFY_HELPER(n)
 #define NODE_STRINGIFY_HELPER(n) #n
@@ -218,8 +223,7 @@ NODE_EXTERN int Start(void* event_loop,
                       int argc, const char* const* argv,
                       int exec_argc, const char* const* exec_argv,
                       bool is_main = false,
-                      std::function<void(v8::TaskRunner*, v8::TaskRunner*)> setupCallback =
-                        std::function<void(v8::TaskRunner*, v8::TaskRunner*)>());
+                      std::function<void(v8::TaskRunner*, v8::TaskRunner*)> setupCallback = nullptr);
 
 NODE_EXTERN v8::TaskRunner* GetNodeIsolateForegroundTaskRunner();
 NODE_EXTERN v8::TaskRunner* GetNodeIsolateBackgroundTaskRunner();
