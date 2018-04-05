@@ -2489,13 +2489,15 @@ Mutex dlib_mutex;
 struct DLib;
 
 std::unordered_map<std::string, std::shared_ptr<DLib>> dlopen_cache;
-std::unordered_map<decltype(uv_lib_t().handle), std::shared_ptr<DLib>>
+
+typedef decltype(uv_lib_t().handle) dlib_handle_t;
+std::unordered_map<dlib_handle_t, std::shared_ptr<DLib>>
     handle_to_dlib;
 
 struct DLib : public std::enable_shared_from_this<DLib> {
   std::string filename_;
   std::string errmsg_;
-  void* handle_ = nullptr;
+  dlib_handle_t handle_ = nullptr;
   int flags_;
   std::unordered_set<Environment*> users_;
   node_module* own_info = nullptr;
@@ -2527,7 +2529,7 @@ struct DLib : public std::enable_shared_from_this<DLib> {
   bool Open() {
     int ret = uv_dlopen(filename_.c_str(), &lib_);
     if (ret == 0) {
-      handle_ = static_cast<void*>(lib_.handle);
+      handle_ = lib_.handle;
       return true;
     }
     errmsg_ = uv_dlerror(&lib_);
