@@ -510,6 +510,11 @@ class TestCase(object):
 
   def RunCommand(self, command, env):
     full_command = self.context.processor(command)
+    kNodeWorkerWrapperKey = 'NODE_WORKER_TEST_WRAPPER'
+    if ((kNodeWorkerWrapperKey in os.environ.keys()) and (os.environ[kNodeWorkerWrapperKey] != "")):
+        worker_wrapper = os.environ[kNodeWorkerWrapperKey]
+        full_command = full_command[0:1] + [worker_wrapper] + full_command[1:]
+        #print("===================", full_command);
     output = Execute(full_command,
                      self.context,
                      self.context.GetTimeout(self.mode),
