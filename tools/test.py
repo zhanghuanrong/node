@@ -512,9 +512,18 @@ class TestCase(object):
     full_command = self.context.processor(command)
     kNodeWorkerWrapperKey = 'NODE_WORKER_TEST_WRAPPER'
     if ((kNodeWorkerWrapperKey in os.environ.keys()) and (os.environ[kNodeWorkerWrapperKey] != "")):
-        worker_wrapper = os.environ[kNodeWorkerWrapperKey]
-        full_command = full_command[0:1] + [worker_wrapper] + full_command[1:]
-        #print("===================", full_command);
+      script_index = 0
+      for i in range(1, len(full_command)):
+        all_contains = full_command[i].endswith('js')
+        for j in range(0, len(self.path)):
+          if not self.path[j] in full_command[i]:
+            all_contains = False 
+        if all_contains:
+          script_index = i
+          break
+      worker_wrapper = os.environ[kNodeWorkerWrapperKey]
+      full_command = full_command[0:script_index] + [worker_wrapper] + full_command[script_index:]
+    print("===================", full_command);
     output = Execute(full_command,
                      self.context,
                      self.context.GetTimeout(self.mode),
