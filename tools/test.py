@@ -523,7 +523,6 @@ class TestCase(object):
           break
       worker_wrapper = os.environ[kNodeWorkerWrapperKey]
       full_command = full_command[0:script_index] + [worker_wrapper] + full_command[script_index:]
-    print("===================", full_command);
     output = Execute(full_command,
                      self.context,
                      self.context.GetTimeout(self.mode),
