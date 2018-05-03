@@ -4488,6 +4488,31 @@ Local<Context> NewContext(Isolate* isolate,
 }
 
 
+Local<Context> CreateContextWithTheSameSettingAsMainThread(
+    Isolate* isolate,
+    Local<ObjectTemplate> object_template) {
+  return NewContext(isolate, object_template);
+}
+
+
+void LoadEnvironmentWithTheSameSettingAsMainThread(Environment* env) {
+  env->set_abort_on_uncaught_exception(abort_on_uncaught_exception);
+
+  if (no_force_async_hooks_checks) {
+    env->async_hooks()->no_force_checks();
+  }
+
+  {
+    Environment::AsyncCallbackScope callback_scope(env);
+    env->async_hooks()->push_async_ids(1, 0);
+    LoadEnvironment(env);
+    env->async_hooks()->pop_async_id(1);
+  }
+
+  env->set_trace_sync_io(trace_sync_io);
+}
+
+
 inline int Start(Isolate* isolate, IsolateData* isolate_data,
                  int argc, const char* const* argv,
                  int exec_argc, const char* const* exec_argv) {
@@ -4563,6 +4588,45 @@ bool AllowWasmCodeGenerationCallback(
     context->GetEmbedderData(ContextEmbedderIndex::kAllowWasmCodeGeneration);
   return wasm_code_gen->IsUndefined() || wasm_code_gen->IsTrue();
 }
+
+
+static ArrayBufferAllocator allocator;
+
+
+v8::Isolate* CreateIsolateWithTheSameSettingAsMainThread() {
+  Isolate::CreateParams params;
+  params.array_buffer_allocator = &allocator;
+#ifdef NODE_ENABLE_VTUNE_PROFILING
+  params.code_event_handler = vTune::GetVtuneCodeEventHandler();
+#endif
+
+  Isolate* const isolate = Isolate::New(params);
+  if (isolate != nullptr) {
+    isolate->AddMessageListener(OnMessage);
+    isolate->SetAbortOnUncaughtExceptionCallback(ShouldAbortOnUncaughtException);
+    isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
+    isolate->SetFatalErrorHandler(OnFatalError);
+    isolate->SetAllowWasmCodeGenerationCallback(AllowWasmCodeGenerationCallback);
+  }
+
+  return isolate;
+}
+
+
+IsolateData* CreateIsolateDataWithTheSameSettingAsMainThread(
+    Isolate* isolate,
+    uv_loop_t* loop,
+    MultiIsolatePlatform* platform) {
+  IsolateData* isolate_data = new IsolateData(isolate, loop, platform, allocator.zero_fill_field());
+
+  // To be delt with.
+  if (track_heap_objects) {
+    isolate->GetHeapProfiler()->StartTrackingHeapObjects(true);
+  }
+
+  return isolate_data;
+}
+
 
 inline int Start(uv_loop_t* event_loop,
                  int argc, const char* const* argv,

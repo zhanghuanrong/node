@@ -256,6 +256,16 @@ NODE_EXTERN void FreeEnvironment(Environment* env);
 // it would return nullptr.
 NODE_EXTERN MultiIsolatePlatform* GetMainThreadMultiIsolatePlatform();
 
+NODE_EXTERN v8::Isolate* CreateIsolateWithTheSameSettingAsMainThread();
+NODE_EXTERN IsolateData* CreateIsolateDataWithTheSameSettingAsMainThread(
+    v8::Isolate* isolate,
+    struct uv_loop_s* loop,
+    MultiIsolatePlatform* platform);
+NODE_EXTERN v8::Local<v8::Context> CreateContextWithTheSameSettingAsMainThread(
+    v8::Isolate* isolate,
+    v8::Local<v8::ObjectTemplate> object_template = v8::Local<v8::ObjectTemplate>());
+NODE_EXTERN void LoadEnvironmentWithTheSameSettingAsMainThread(Environment* env);
+
 NODE_EXTERN MultiIsolatePlatform* CreatePlatform(
     int thread_pool_size,
     v8::TracingController* tracing_controller);
