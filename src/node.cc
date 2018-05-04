@@ -2230,6 +2230,7 @@ inline InitializerCallback GetInitializerCallback(DLib* dlib) {
 // TODO: Just a temporal fix. Lot of others need to be figure out later, like
 // synchronization, etc.
 static std::map<std::string, node_module*> addon_modules;
+static Mutex dlib_mutex;
 
 // DLOpen is process.dlopen(module, filename, flags).
 // Used to load 'module.node' dynamically shared objects.
@@ -2238,6 +2239,8 @@ static std::map<std::string, node_module*> addon_modules;
 // when two contexts try to load the same shared object. Maybe have a shadow
 // cache that's a plain C list or hash table that's shared across contexts?
 static void DLOpen(const FunctionCallbackInfo<Value>& args) {
+  Mutex::ScopedLock lock(dlib_mutex);
+  
   Environment* env = Environment::GetCurrent(args);
   auto context = env->context();
 
